@@ -1,0 +1,13 @@
+# secrets
+.streamlit/secrets.toml
+
+# local DB / user data
+data/app.db
+data/*.db
+
+# python
+__pycache__/
+*.pyc
+
+# mac/windows
+.DS_Store
