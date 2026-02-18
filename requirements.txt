@@ -1,6 +1,5 @@
 streamlit>=1.43.0
 requests
 passlib[bcrypt]
-streamlit>=1.43.0
 pypdf
 python-docx

@@ -39,8 +39,8 @@ from lib.storage import (
 st.set_page_config(page_title="Ollama Chat (Threads + History)", layout="wide")
 init_db()
 
-OLLAMA_HOST = st.secrets.get("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_API_KEY = st.secrets.get("OLLAMA_API_KEY", None)
+OLLAMA_HOST = st.secrets.get("OLLAMA_HOST", os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
+OLLAMA_API_KEY = st.secrets.get("OLLAMA_API_KEY", os.environ.get("OLLAMA_API_KEY", None))
 BOOTSTRAP_PASSWORD = st.secrets.get("BOOTSTRAP_PASSWORD", "change-this-now")
 
 ACTIVE_MODEL_KEY = "active_model"
@@ -48,6 +48,14 @@ SYSTEM_PROMPT_KEY = "global_system_prompt"
 
 DEFAULT_SYSTEM_PROMPT = "You are a helpful tutor. Be clear, concise, and accurate."
 DEFAULT_MODEL_FALLBACKS = ["gpt-oss:20b", "gpt-oss:20b-cloud"]
+MODEL_ALLOWLIST = st.secrets.get("MODEL_ALLOWLIST", os.environ.get("MODEL_ALLOWLIST", "")).strip()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _cached_model_choices(host: str, api_key: str | None):
+    """Cache /api/tags results to avoid re-fetching on every rerun."""
+    return list_models(host, api_key)
+
 
 # Attachments
 MAX_ATTACHMENTS_PER_MESSAGE = 5
@@ -306,10 +314,29 @@ else:
     page = st.sidebar.radio("Page", ["Chat", "Admin Dashboard"], index=0)
 
 # ---------------- Sidebar: Admin controls ----------------
-try:
-    model_choices = list_models(OLLAMA_HOST, OLLAMA_API_KEY) or DEFAULT_MODEL_FALLBACKS
-except Exception:
+st.sidebar.caption(f"Model host: {OLLAMA_HOST}")
+
+if ("ollama.com" in OLLAMA_HOST.lower()) and (not OLLAMA_API_KEY):
+    st.sidebar.error("Missing OLLAMA_API_KEY for Ollama Cloud. Add it in Streamlit Secrets.")
     model_choices = DEFAULT_MODEL_FALLBACKS
+else:
+    try:
+        model_choices = _cached_model_choices(OLLAMA_HOST, OLLAMA_API_KEY) or DEFAULT_MODEL_FALLBACKS
+    except Exception as e:
+        if "localhost" in OLLAMA_HOST or "127.0.0.1" in OLLAMA_HOST:
+            st.sidebar.warning(
+                "Could not reach the local Ollama server. If this is a Streamlit Cloud deployment, "
+                'set OLLAMA_HOST to "https://ollama.com" and provide OLLAMA_API_KEY in Secrets.'
+            )
+        else:
+            st.sidebar.warning(f"Could not fetch model list: {e}")
+        model_choices = DEFAULT_MODEL_FALLBACKS
+
+# Optional: restrict dropdown to a comma-separated allowlist (useful for classroom deployments)
+if MODEL_ALLOWLIST:
+    allowed = {m.strip() for m in MODEL_ALLOWLIST.split(",") if m.strip()}
+    model_choices = [m for m in model_choices if m in allowed] or model_choices
+
 
 active_model = load_active_model()
 system_prompt = load_system_prompt()
@@ -523,47 +550,35 @@ if page == "Chat":
                 st.session_state.editing_text = ""
                 st.rerun()
 
-    # Chat input (ChatGPT-like): text + attachments in one send
+    # Normal input (disable while editing to avoid confusion)
     if st.session_state.editing_msg_id is None:
-        try:
-            submission = st.chat_input(
-                "Type your message…",
-                accept_file="multiple",
-                file_type=[
-                    "png",
-                    "jpg",
-                    "jpeg",
-                    "webp",
-                    "txt",
-                    "md",
-                    "pdf",
-                    "docx",
-                    "csv",
-                    "json",
-                    "py",
-                    "js",
-                    "html",
-                    "css",
-                ],
-                max_upload_size=MAX_TOTAL_UPLOAD_MB,
-            )
-        except TypeError:
-            st.error(
-                "Your Streamlit version doesn't support file attachments in st.chat_input. "
-                "Upgrade with: pip install -U 'streamlit>=1.43.0'"
-            )
-            submission = None
+        submission = st.chat_input(
+            "Type your message…",
+            accept_file="multiple",
+            file_type=[
+                "png",
+                "jpg",
+                "jpeg",
+                "webp",
+                "gif",
+                "pdf",
+                "docx",
+                "txt",
+                "md",
+                "csv",
+                "json",
+            ],
+            key="chat_input_box",
+        )
     else:
         submission = None
 
     if submission:
-        prompt = getattr(submission, "text", "") or ""
-        uploads = getattr(submission, "files", []) or []
-    else:
-        prompt = ""
-        uploads = []
+        text = (getattr(submission, 'text', '') or '').strip()
+        uploads = list(getattr(submission, 'files', []) or [])
+        if (not text) and uploads:
+            text = 'Please analyze the attached file(s).'
 
-    if prompt.strip() or uploads:
         # ---- Collect attachments selected for this message ----
         if len(uploads) > MAX_ATTACHMENTS_PER_MESSAGE:
             st.error(f"Too many attachments. Max is {MAX_ATTACHMENTS_PER_MESSAGE}.")
@@ -603,14 +618,10 @@ if page == "Chat":
             st.error(f"Attachments are too large. Total must be <= {MAX_TOTAL_UPLOAD_MB} MB.")
             st.stop()
 
-
-        if not prompt.strip() and uploads:
-            prompt = "📎 Sent attachments"
-
         if st.session_state.conversation_id is None:
             title = st.session_state.draft_title.strip()
             if not title:
-                title = (prompt.strip()[:60] or "(untitled)")
+                title = (text[:60] or "(untitled)")
             st.session_state.conversation_id = create_conversation(
                 user_id=current_user,
                 role=current_role,
@@ -628,7 +639,7 @@ if page == "Chat":
             system_prompt=system_prompt,
         )
 
-        user_msg_id = add_message(conv_id, "user", prompt)
+        user_msg_id = add_message(conv_id, "user", text)
 
         # Persist attachments (if any)
         saved_atts = []
@@ -641,6 +652,8 @@ if page == "Chat":
                     mime=a["mime"],
                     data=a["data"],
                     text_content=a.get("text_content"),
+                    user_id=current_user,
+                    conversation_id=conv_id,
                 )
             except Exception:
                 # If persistence fails, still allow the chat to proceed.
@@ -648,11 +661,11 @@ if page == "Chat":
             saved_atts.append(a)
 
         st.session_state.chat.append(
-            {"id": user_msg_id, "role": "user", "content": prompt, "attachments": saved_atts}
+            {"id": user_msg_id, "role": "user", "content": text, "attachments": saved_atts}
         )
 
         with st.chat_message("user"):
-            st.markdown(prompt)
+            st.markdown(text)
             _render_attachments(saved_atts, key_prefix=f"send_{user_msg_id}")
 
         payload_messages = _build_payload_messages(st.session_state.chat, system_prompt)
@@ -686,6 +699,9 @@ if page == "Chat":
                 system_prompt=system_prompt,
             )
             st.toast("Auto-saved ✅", icon="💾")
+
+        # Clear uploader state after send
+        st.session_state.attachments_uploader = []
 
 # ---------------- Page: Student History ----------------
 if page == "My History":
