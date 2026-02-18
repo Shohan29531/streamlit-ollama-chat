@@ -4,3 +4,4 @@ requests
 passlib[bcrypt]
 pypdf
 python-docx
+psycopg[binary]==3.3.2
