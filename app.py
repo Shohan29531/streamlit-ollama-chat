@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import base64
 import requests
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -10,10 +11,8 @@ from streamlit_cookies_manager_ext import EncryptedCookieManager
 from lib.ollama_api import chat_stream, list_models
 from lib.render import render_chat_text
 from lib.attachments import (
-    detect_kind,
     extract_text_from_bytes,
     is_image_mime,
-    to_data_url,
 )
 from lib.storage import (
     init_db,
@@ -54,7 +53,11 @@ APP_NAME = "DS330 Chat"
 DEFAULT_BASE_PROMPT = """You are a helpful assistant for DS330. Follow the course rules and be concise, correct, and student-friendly."""
 
 # If the model supports it (e.g., gpt-oss), enable extended thinking by default.
-DEFAULT_THINK = "high"  # gpt-oss: low|medium|high
+DEFAULT_THINK = None  # disable extended thinking by default
+
+# When building LLM payloads, include heavy attachment context only for recent user turns.
+INCLUDE_FILE_TEXT_LAST_N_USER_MSGS = 3
+INCLUDE_IMAGES_LAST_N_USER_MSGS = 1
 
 
 def _secret(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -351,7 +354,12 @@ def _conversation_to_text(messages: List[Dict[str, Any]]) -> str:
 
 
 def _build_payload_messages(conversation_id: int) -> List[Dict[str, Any]]:
-    """Build messages payload for Ollama /api/chat."""
+    """Build messages payload for Ollama /api/chat.
+
+    Ollama's ChatRequest expects:
+      - messages[].content as a STRING (not an array)
+      - optional messages[].images as a list of base64-encoded image bytes
+    """
     conv = st.session_state.get("conversation_meta") or get_conversation(conversation_id) or {}
 
     # Prefer per-conversation snapshot prompt (for reproducibility)
@@ -371,36 +379,43 @@ def _build_payload_messages(conversation_id: int) -> List[Dict[str, Any]]:
 
     payload: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
 
-    for m in st.session_state.get("messages", []):
-        role = m["role"]
+    msgs = st.session_state.get("messages", [])
+    user_idxs = [i for i, mm in enumerate(msgs) if mm.get("role") == "user"]
+    include_files_from = set(user_idxs[-INCLUDE_FILE_TEXT_LAST_N_USER_MSGS:]) if INCLUDE_FILE_TEXT_LAST_N_USER_MSGS > 0 else set()
+    include_images_from = set(user_idxs[-INCLUDE_IMAGES_LAST_N_USER_MSGS:]) if INCLUDE_IMAGES_LAST_N_USER_MSGS > 0 else set()
+
+    for i, m in enumerate(msgs):
+        role = m.get("role") or "user"
         content = m.get("content") or ""
 
         if role == "user":
-            # Add images inline for the model
-            blocks: List[Dict[str, Any]] = []
-            if content.strip():
-                blocks.append({"type": "text", "text": content})
+            content_out = content
+            msg_obj: Dict[str, Any] = {"role": "user", "content": content_out}
 
-            for att in (m.get("attachments") or []):
-                if att.get("kind") == "image" and att.get("data"):
-                    blocks.append(
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": to_data_url(att["mime"], att["data"])},
-                        }
-                    )
-                elif att.get("kind") == "file" and att.get("text_content"):
-                    blocks.append(
-                        {
-                            "type": "text",
-                            "text": f"\n\n[Attached file: {att.get('filename','file')}\n{att.get('text_content','')}]\n",
-                        }
-                    )
+            atts = m.get("attachments") or []
 
-            if blocks:
-                payload.append({"role": "user", "content": blocks})
-            else:
-                payload.append({"role": "user", "content": ""})
+            # Append extracted file text for the last N user messages only (keeps prompts small).
+            if i in include_files_from:
+                for att in atts:
+                    if att.get("kind") == "file" and att.get("text_content"):
+                        fn = att.get("filename") or "file"
+                        content_out += f"\n\n[Attached file: {fn}]\n{att.get('text_content','')}\n"
+                msg_obj["content"] = content_out
+
+            # Include images as base64 for the last N user messages only.
+            if i in include_images_from:
+                images_b64: List[str] = []
+                for att in atts:
+                    if att.get("kind") == "image" and att.get("data"):
+                        try:
+                            images_b64.append(base64.b64encode(att["data"]).decode("utf-8"))
+                        except Exception:
+                            continue
+                if images_b64:
+                    msg_obj["images"] = images_b64
+
+            payload.append(msg_obj)
+
         else:
             payload.append({"role": "assistant", "content": content})
 
@@ -544,6 +559,12 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
         # Ensure state
     st.session_state.setdefault("messages", [])
     st.session_state.setdefault("conversation_meta", {})
+
+    # Chat header (ChatGPT-like)
+    title = f"{active_model}"
+    if DEFAULT_THINK:
+        title += " — Thinking"
+    st.markdown(f"# {title}")
 
     # Sidebar thread picker
     with st.sidebar:
