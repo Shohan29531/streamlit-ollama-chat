@@ -611,10 +611,10 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
                     st.session_state["conversation_meta"] = get_conversation(int(conv_id)) or {}
                     st.rerun()
 
-    # Chat title (ChatGPT-style): show model, and show Thinking if enabled
-    if active_model:
-        _title = active_model + (" — Thinking" if DEFAULT_THINK else "")
-        st.markdown(f"# {_title}")
+    # # Chat title (ChatGPT-style): show model, and show Thinking if enabled
+    # if active_model:
+    #     _title = active_model + (" — Thinking" if DEFAULT_THINK else "")
+    #     st.markdown(f"# {_title}")
 
     # Render chat history
     msgs = st.session_state.get("messages", [])
