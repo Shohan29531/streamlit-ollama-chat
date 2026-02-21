@@ -5,7 +5,8 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
-from passlib.hash import bcrypt
+import hmac
+from passlib.hash import bcrypt, pbkdf2_sha256
 
 # Optional: psycopg (Postgres) for Supabase Postgres
 try:
@@ -452,19 +453,70 @@ def upsert_user(user_id: str, password: str, role: str) -> None:
 
 
 def verify_user(user_id: str, password: str) -> Optional[Dict[str, str]]:
+    """Verify user credentials.
+
+    Backwards-compatible:
+      - bcrypt hashes (preferred)
+      - legacy pbkdf2_sha256 hashes
+      - legacy plaintext passwords (auto-upgraded to bcrypt on successful login)
+    """
     row = _exec(
-        "SELECT user_id, password_hash, role FROM users WHERE user_id = ?" if not _USE_PG else "SELECT user_id, password_hash, role FROM users WHERE user_id = %s",
+        "SELECT user_id, password_hash, role FROM users WHERE user_id = ?"
+        if not _USE_PG
+        else "SELECT user_id, password_hash, role FROM users WHERE user_id = %s",
         (user_id,),
         fetch="one",
     )
     if not row:
         return None
+
     d = row if isinstance(row, dict) else {"user_id": row[0], "password_hash": row[1], "role": row[2]}
-    if bcrypt.verify(password, d["password_hash"]):
-        return {"user_id": d["user_id"], "role": d["role"]}
-    return None
+    stored = d.get("password_hash")
 
+    if stored is None:
+        return None
 
+    # Normalize common representations (bytes / byte-literals / whitespace)
+    if isinstance(stored, (bytes, bytearray)):
+        stored = stored.decode("utf-8", errors="ignore")
+    stored = str(stored).strip()
+    if (stored.startswith("b'") and stored.endswith("'")) or (stored.startswith('b"') and stored.endswith('"')):
+        stored = stored[2:-1]
+
+    ok = False
+
+    # Preferred: bcrypt
+    if stored.startswith("$2"):
+        try:
+            ok = bcrypt.verify(password, stored)
+        except Exception:
+            ok = False
+
+    # Legacy: pbkdf2_sha256
+    elif stored.startswith("$pbkdf2-sha256$"):
+        try:
+            ok = pbkdf2_sha256.verify(password, stored)
+        except Exception:
+            ok = False
+
+    # Legacy: plaintext (NOT recommended, but helps when migrating older DBs)
+    else:
+        ok = hmac.compare_digest(password, stored)
+
+    if not ok:
+        return None
+
+    # Upgrade legacy hashes to bcrypt
+    if not stored.startswith("$2"):
+        new_hash = bcrypt.hash(password)
+        _exec(
+            "UPDATE users SET password_hash = ? WHERE user_id = ?"
+            if not _USE_PG
+            else "UPDATE users SET password_hash = %s WHERE user_id = %s",
+            (new_hash, user_id),
+        )
+
+    return {"user_id": d["user_id"], "role": d["role"]}
 def list_users() -> List[Dict[str, Any]]:
     rows = _exec("SELECT user_id, role FROM users ORDER BY user_id", fetch="all")
     return _rows_to_dicts(rows)
