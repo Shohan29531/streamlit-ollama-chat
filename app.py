@@ -564,7 +564,7 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
     title = f"{active_model}"
     if DEFAULT_THINK:
         title += " — Thinking"
-    st.markdown(f"# {title}")
+    st.markdown("DS330 Chat Assistant")
 
     # Sidebar thread picker
     with st.sidebar:
