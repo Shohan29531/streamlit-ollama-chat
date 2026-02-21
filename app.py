@@ -1,5 +1,6 @@
 import os
 import re
+import json
 from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
@@ -73,7 +74,7 @@ st.set_page_config(page_title=APP_NAME, page_icon="💬", layout="wide")
 st.markdown(
     """
 <style>
-  /* Reduce extra top padding */
+  /* Reduce extra top padding in sidebar */
   section[data-testid="stSidebar"] > div {
     padding-top: 0.25rem;
   }
@@ -90,11 +91,59 @@ st.markdown(
     }
   }
 
-  /* Use the full main-area width (removes large empty gap on wide screens) */
+  /* Use the full main-area width + reduce top whitespace */
   div.block-container {
     max-width: 100% !important;
     padding-left: 1.25rem;
     padding-right: 1.25rem;
+    padding-top: 0.75rem !important;
+  }
+
+  /* Subtle copy buttons (hoverable) */
+  .ds330-copy-wrap {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 0.15rem;
+  }
+  .ds330-copy-btn {
+    font-size: 12px;
+    color: rgba(0, 0, 0, 0.38);
+    background: transparent;
+    border: 1px solid transparent;
+    padding: 2px 8px;
+    border-radius: 8px;
+    cursor: pointer;
+    line-height: 1.4;
+  }
+  .ds330-copy-btn:hover {
+    color: rgba(0, 0, 0, 0.58);
+    border-color: rgba(0, 0, 0, 0.10);
+    background: rgba(0, 0, 0, 0.03);
+  }
+
+  /* Sticky logout section at bottom of sidebar */
+  .ds330-logout-fixed {
+    position: sticky;
+    bottom: 0;
+    padding-top: 0.75rem;
+    padding-bottom: 0.25rem;
+    margin-top: 1rem;
+    border-top: 1px solid rgba(0, 0, 0, 0.08);
+    background: var(--background-color);
+  }
+  .ds330-logout-link {
+    display: block;
+    width: 100%;
+    text-align: center;
+    padding: 0.45rem 0.6rem;
+    border: 1px solid rgba(0, 0, 0, 0.12);
+    border-radius: 10px;
+    text-decoration: none;
+    color: inherit;
+  }
+  .ds330-logout-link:hover {
+    border-color: rgba(0, 0, 0, 0.18);
+    background: rgba(0, 0, 0, 0.03);
   }
 </style>
 """,
@@ -103,58 +152,37 @@ st.markdown(
 # ---------------- Clipboard button (per-message + whole convo) ----------------
 
 
-def _copy_button(text: str, key: str, tooltip: str = "Copy") -> None:
-    """Render a small copy-to-clipboard button (no downloads)."""
-    # Primary: st-copy-button component (best UX)
-    try:
-        from st_copy_button import st_copy_button  # type: ignore
-        import inspect
-
-        sig = inspect.signature(st_copy_button)
-        kwargs = dict(
-            text=text,
-            before_copy_label="📋",
-            after_copy_label="✅",
-            show_text=False,
-        )
-        if "key" in sig.parameters:
-            kwargs["key"] = key
-        if "help" in sig.parameters:
-            kwargs["help"] = tooltip
-        st_copy_button(**kwargs)
-        return
-    except Exception:
-        pass
-
-    # Fallback: lightweight JS copy button (still copies to clipboard; no downloads)
+def _copy_button(text: str, key: str, label: str, tooltip: str = "Copy") -> None:
+    """Render a subtle copy-to-clipboard button (no downloads)."""
     try:
         import streamlit.components.v1 as components
-        import json as _json
-        payload = _json.dumps(text)
+        payload = json.dumps(text)
+        safe_label = json.dumps(label)
+
         html = f"""
-        <div style="display:flex;align-items:center;justify-content:flex-end;">
-          <button id="{key}" title="{tooltip}"
-            style="border:none;background:transparent;cursor:pointer;padding:0;margin:0;font-size:16px;line-height:1;">
-            📋
-          </button>
+        <div class="ds330-copy-wrap">
+          <button class="ds330-copy-btn" id="{key}" title="{tooltip}" aria-label="{tooltip}">{label}</button>
         </div>
         <script>
-          const btn = document.getElementById("{key}");
-          btn.addEventListener("click", async () => {{
-            try {{
-              await navigator.clipboard.writeText({payload});
-              const old = btn.textContent;
-              btn.textContent = "✅";
-              setTimeout(() => btn.textContent = old, 900);
-            }} catch (e) {{
-              console.error(e);
-            }}
-          }});
+          (() => {{
+            const btn = document.getElementById("{key}");
+            if (!btn) return;
+            btn.addEventListener("click", async () => {{
+              try {{
+                await navigator.clipboard.writeText({payload});
+                const old = btn.textContent;
+                btn.textContent = "copied";
+                setTimeout(() => {{ btn.textContent = old; }}, 900);
+              }} catch (e) {{
+                console.error(e);
+              }}
+            }});
+          }})();
         </script>
         """
-        components.html(html, height=26)
+        components.html(html, height=30)
     except Exception:
-        # As a last resort, render nothing (never offer a download fallback).
+        # Never fall back to downloads.
         return
 
 
@@ -207,6 +235,24 @@ if "user_id" not in st.session_state:
             st.session_state["user_id"] = sess["user_id"]
             st.session_state["role"] = sess["role"]
             st.session_state["session_token"] = sess["token"]
+
+
+
+def _consume_logout_query() -> bool:
+    """If URL contains ?logout=1, log out and consume the query param."""
+    try:
+        qp = dict(st.query_params)  # Streamlit >= 1.31
+    except Exception:
+        qp = st.experimental_get_query_params()  # type: ignore
+
+    if str(qp.get("logout", ["0"])[0] if isinstance(qp.get("logout"), list) else qp.get("logout", "0")) == "1":
+        _logout()
+        try:
+            st.query_params.clear()
+        except Exception:
+            st.experimental_set_query_params()  # type: ignore
+        return True
+    return False
 
 
 # ---------------- Model list (Ollama Cloud) ----------------
@@ -430,12 +476,20 @@ def _sidebar(models: List[str]) -> Tuple[str, str, Dict[str, Any]]:
         st.sidebar.caption(f"**Active model:** {active_model}")
 
     st.sidebar.divider()
-    page = st.sidebar.radio("", ["Chat", "Admin Dashboard"] if is_admin else ["Chat"], index=0, key="nav_page")
+    if is_admin:
+        page = st.sidebar.radio("", ["Chat", "Admin Dashboard"], index=0, key="nav_page")
+        st.sidebar.divider()
+    else:
+        page = "Chat"
 
-    st.sidebar.divider()
-    if st.sidebar.button("Logout"):
-        _logout()
-        st.rerun()
+    st.sidebar.markdown(
+        '''
+<div class="ds330-logout-fixed">
+  <a class="ds330-logout-link" href="?logout=1">Logout</a>
+</div>
+''',
+        unsafe_allow_html=True,
+    )
 
     return page, active_model, active_assignment
 
@@ -474,28 +528,7 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
     role = st.session_state["role"]
     is_admin = role == "admin"
 
-    st.title(APP_NAME)
-
-    # Thread title (saved per conversation)
-    conv_id_existing = st.session_state.get("conversation_id")
-    if conv_id_existing:
-        meta = st.session_state.get("conversation_meta") or {}
-        current_title = meta.get("title") or ""
-        tcols = st.columns([0.75, 0.25])
-        with tcols[0]:
-            new_title = st.text_input("Thread title", value=current_title, key="thread_title")
-        with tcols[1]:
-            if st.button("Save title", key="save_title"):
-                touch_conversation(int(conv_id_existing), title=new_title)
-                st.session_state["conversation_meta"] = get_conversation(int(conv_id_existing)) or {}
-                st.rerun()
-
-        # Snapshot metadata
-        if meta.get("assignment_name"):
-            st.caption(f"This thread uses assignment: **{meta.get('assignment_name')}** · Model: **{meta.get('model')}**")
-
-
-    # Ensure state
+        # Ensure state
     st.session_state.setdefault("messages", [])
     st.session_state.setdefault("conversation_meta", {})
 
@@ -524,6 +557,26 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
                 _load_conversation_into_state(int(picked))
             st.rerun()
 
+        # Optional: thread title editor (kept in sidebar to reduce main-panel whitespace)
+        conv_id = st.session_state.get("conversation_id")
+        if conv_id:
+            meta = st.session_state.get("conversation_meta") or {}
+            st.divider()
+            st.caption("Thread title")
+            tcols = st.columns([0.78, 0.22])
+            with tcols[0]:
+                new_title = st.text_input(
+                    "",
+                    value=meta.get("title") or "",
+                    key="thread_title_sidebar",
+                    label_visibility="collapsed",
+                )
+            with tcols[1]:
+                if st.button("Save", key="save_title_sidebar"):
+                    touch_conversation(int(conv_id), title=(new_title.strip() or None))
+                    st.session_state["conversation_meta"] = get_conversation(int(conv_id)) or {}
+                    st.rerun()
+
     # Render chat history
     msgs = st.session_state.get("messages", [])
     last_assistant_idx = max((i for i, m in enumerate(msgs) if m["role"] == "assistant"), default=-1)
@@ -534,19 +587,21 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
             _render_attachments(m.get("attachments") or [])
 
             # Per-message copy button (one per message)
-            ccols = st.columns([0.92, 0.08])
-            with ccols[1]:
-                _copy_button(m.get("content") or "", key=f"copy_msg_{m.get('id','x')}", tooltip="Copy this message")
+            _copy_button(
+                m.get("content") or "",
+                key=f"copy_msg_{m.get('id','x')}",
+                label="copy",
+                tooltip="Copy this message",
+            )
 
             # Copy whole conversation (bottom of last assistant response)
             if i == last_assistant_idx:
-                tcols = st.columns([0.80, 0.20])
-                with tcols[1]:
-                    _copy_button(
-                        _conversation_to_text(msgs),
-                        key=f"copy_conv_{st.session_state.get('conversation_id','new')}",
-                        tooltip="Copy the full conversation (text only)",
-                    )
+                _copy_button(
+                    _conversation_to_text(msgs),
+                    key=f"copy_conv_{st.session_state.get('conversation_id','new')}",
+                    label="copy all",
+                    tooltip="Copy the full conversation (text only)",
+                )
 
             # Conversation edit controls — ADMIN ONLY
             if is_admin and m["role"] == "user":
@@ -689,9 +744,7 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
         st.markdown(user_text)
         _render_attachments(attachments)
         # per message copy
-        ccols = st.columns([0.92, 0.08])
-        with ccols[1]:
-            _copy_button(user_text, key=f"copy_msg_{user_msg_id}")
+        _copy_button(user_text, key=f"copy_msg_{user_msg_id}", label="copy", tooltip="Copy this message")
 
     # Build payload and stream assistant
     payload = _build_payload_messages(int(conv_id))
@@ -723,37 +776,55 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
 # ---------------- Admin dashboard ----------------
 
 
+
 def _admin_dashboard(active_model: str) -> None:
-    st.title("Admin Dashboard")
+    st.markdown("### Admin Dashboard")
 
-    # Assignment & prompt editor
-    st.subheader("Assignments & System Prompts")
+    tab_prompts, tab_users, tab_convs = st.tabs(["Assignments & Prompts", "Users", "Conversation Browser"])
 
-    active = get_active_assignment()
-    assignments = list_assignments()
+    # ---------------- Tab: Assignments & Prompts ----------------
+    with tab_prompts:
+        st.subheader("Assignments")
 
-    name_by_id = {int(a["id"]): a["name"] for a in assignments}
-    ids = list(name_by_id.keys())
-    idx = ids.index(int(active["id"])) if int(active["id"]) in ids else 0
+        active = get_active_assignment()
+        assignments = list_assignments()
 
-    c1, c2 = st.columns([0.55, 0.45])
-    with c1:
-        new_active = st.selectbox(
-            "Active assignment",
-            ids,
-            index=idx,
-            format_func=lambda i: name_by_id.get(int(i), str(i)),
-        )
-        if int(new_active) != int(active["id"]):
-            set_active_assignment(int(new_active))
-            st.rerun()
+        if assignments:
+            name_by_id = {int(a["id"]): a["name"] for a in assignments}
+            ids = list(name_by_id.keys())
+            idx = ids.index(int(active["id"])) if int(active["id"]) in ids else 0
 
-        st.caption(f"Currently editing prompts for: **{get_active_assignment().get('name')}**")
+            c1, c2 = st.columns([0.60, 0.40])
+            with c1:
+                new_active = st.selectbox(
+                    "Active assignment",
+                    ids,
+                    index=idx,
+                    format_func=lambda i: name_by_id.get(int(i), str(i)),
+                )
+                if int(new_active) != int(active["id"]):
+                    set_active_assignment(int(new_active))
+                    st.rerun()
 
-        with st.expander("➕ Add new assignment", expanded=False):
-            new_name = st.text_input("Assignment name", placeholder="Assignment 2")
-            new_prompt = st.text_area("Assignment-specific prompt (optional)", height=160)
-            if st.button("Create assignment"):
+                st.caption(f"Currently active: **{get_active_assignment().get('name')}**")
+
+            with c2:
+                with st.expander("➕ Add new assignment", expanded=False):
+                    new_name = st.text_input("Assignment name", placeholder="Assignment 2")
+                    new_prompt = st.text_area("Assignment-specific prompt (optional)", height=180)
+                    if st.button("Create assignment", key="create_assignment_btn"):
+                        if not new_name.strip():
+                            st.error("Assignment name is required")
+                        else:
+                            aid = add_assignment(new_name.strip(), new_prompt or "")
+                            set_active_assignment(aid)
+                            st.success(f"Created and activated '{new_name.strip()}'")
+                            st.rerun()
+        else:
+            st.warning("No assignments found. Create your first assignment below.")
+            new_name = st.text_input("Assignment name", placeholder="Assignment 1")
+            new_prompt = st.text_area("Assignment-specific prompt (optional)", height=180)
+            if st.button("Create assignment", key="create_assignment_btn_empty"):
                 if not new_name.strip():
                     st.error("Assignment name is required")
                 else:
@@ -762,93 +833,105 @@ def _admin_dashboard(active_model: str) -> None:
                     st.success(f"Created and activated '{new_name.strip()}'")
                     st.rerun()
 
-    with c2:
-        base_prompt = get_base_system_prompt(DEFAULT_BASE_PROMPT)
-        base_edit = st.text_area(
-            "Base system prompt (applies to ALL assignments)",
-            value=base_prompt,
-            height=320,
+        st.divider()
+        st.subheader("System Prompts")
+
+        active = get_active_assignment()
+        header = active.get("name") or "(no assignment)"
+        st.caption(f"Editing prompts for: **{header}**")
+
+        p1, p2 = st.columns(2, gap="large")
+
+        with p1:
+            base_prompt = get_base_system_prompt(DEFAULT_BASE_PROMPT)
+            base_edit = st.text_area(
+                "Base system prompt (applies to ALL assignments)",
+                value=base_prompt,
+                height=520,
+            )
+            if st.button("Save base prompt", type="primary", key="save_base_prompt_btn"):
+                set_base_system_prompt(base_edit)
+                st.success("Saved base system prompt")
+
+        with p2:
+            ap_edit = st.text_area(
+                "Assignment-specific prompt (applies only to this assignment)",
+                value=active.get("prompt") or "",
+                height=520,
+            )
+            if st.button("Save assignment prompt", type="primary", key="save_assignment_prompt_btn"):
+                update_assignment_prompt(int(active["id"]), ap_edit)
+                st.success("Saved assignment prompt")
+
+    # ---------------- Tab: Users ----------------
+    with tab_users:
+        st.subheader("Users")
+        users = list_users()
+        st.dataframe(users, use_container_width=True, hide_index=True)
+
+        with st.expander("Add / Update user", expanded=False):
+            uid = st.text_input("User ID", key="new_uid")
+            pw = st.text_input("Password", type="password", key="new_pw")
+            role = st.selectbox("Role", ["student", "admin"], key="new_role")
+            if st.button("Save user", key="save_user_btn"):
+                if not uid or not pw:
+                    st.error("User ID and password are required.")
+                else:
+                    upsert_user(uid, pw, role)
+                    st.success("User saved")
+                    st.rerun()
+
+    # ---------------- Tab: Conversation Browser ----------------
+    with tab_convs:
+        st.subheader("Conversation browser")
+
+        c1, c2, c3 = st.columns([0.42, 0.30, 0.28])
+        with c1:
+            user_filter = st.text_input("Filter by user_id (contains)", "")
+        with c2:
+            model_filter = st.text_input("Filter by model (exact)", "")
+        with c3:
+            role_filter = st.selectbox("Filter by role", ["", "student", "admin"], index=0)
+
+        convs = list_conversations_admin(
+            user_filter=user_filter or None,
+            role_filter=role_filter or None,
+            model_filter=model_filter or None,
+            limit=200,
         )
-        if st.button("Save base prompt", type="primary"):
-            set_base_system_prompt(base_edit)
-            st.success("Saved base system prompt")
 
-    # Assignment-specific prompt (full width)
-    active = get_active_assignment()
-    ap_edit = st.text_area(
-        f"Assignment-specific prompt — {active.get('name')}",
-        value=active.get("prompt") or "",
-        height=320,
-    )
-    if st.button("Save assignment prompt"):
-        update_assignment_prompt(int(active["id"]), ap_edit)
-        st.success("Saved assignment prompt")
+        if not convs:
+            st.caption("No conversations match filters.")
+            return
 
-    st.divider()
+        conv_ids = [c["id"] for c in convs]
+        labels = {}
+        for c in convs:
+            cid = c["id"]
+            title = c.get("title") or f"Conversation {cid}"
+            labels[cid] = f"{c.get('updated_at','')} · {c.get('user_id','')} · {title}"
 
-    # User management (existing)
-    st.subheader("Users")
-    users = list_users()
-    st.dataframe(users, use_container_width=True, hide_index=True)
+        picked = st.selectbox("Select conversation", conv_ids, format_func=lambda x: labels.get(x, str(x)))
+        conv = get_conversation(int(picked)) or {}
+        msgs = get_conversation_messages(int(picked))
 
-    with st.expander("Add / Update user"):
-        uid = st.text_input("User ID", key="new_uid")
-        pw = st.text_input("Password", type="password", key="new_pw")
-        role = st.selectbox("Role", ["student", "admin"], key="new_role")
-        if st.button("Save user"):
-            if not uid or not pw:
-                st.error("User ID and password are required.")
-            else:
-                upsert_user(uid, pw, role)
-                st.success("User saved")
-                st.rerun()
+        st.caption(f"Model: **{conv.get('model')}** · Assignment: **{conv.get('assignment_name') or '—'}**")
 
-    st.divider()
-
-    # Conversation browser
-    st.subheader("Conversation browser")
-    user_filter = st.text_input("Filter by user_id (contains)", "")
-    model_filter = st.text_input("Filter by model (exact)", "")
-    role_filter = st.selectbox("Filter by role", ["", "student", "admin"], index=0)
-
-    convs = list_conversations_admin(
-        user_filter=user_filter or None,
-        role_filter=role_filter or None,
-        model_filter=model_filter or None,
-        limit=200,
-    )
-
-    if not convs:
-        st.caption("No conversations match filters.")
-        return
-
-    conv_ids = [c["id"] for c in convs]
-    labels = {}
-    for c in convs:
-        cid = c["id"]
-        title = c.get("title") or f"Conversation {cid}"
-        labels[cid] = f"{c.get('updated_at','')} · {c.get('user_id','')} · {title}"
-
-    picked = st.selectbox("Select conversation", conv_ids, format_func=lambda x: labels.get(x, str(x)))
-    conv = get_conversation(int(picked)) or {}
-    msgs = get_conversation_messages(int(picked))
-
-    st.caption(
-        f"Model: **{conv.get('model')}** · Assignment: **{conv.get('assignment_name') or '—'}**"
-    )
-
-    transcript = _conversation_to_text([{**m, "attachments": []} for m in msgs])
-    st.text_area("Transcript (text only)", value=transcript, height=260)
-    _copy_button(transcript, key=f"copy_admin_conv_{picked}", tooltip="Copy transcript")
+        transcript = _conversation_to_text([{**m, "attachments": []} for m in msgs])
+        st.text_area("Transcript (text only)", value=transcript, height=320)
+        _copy_button(transcript, key=f"copy_admin_conv_{picked}", label="copy all", tooltip="Copy transcript")
 
 
-# ---------------- Main routing ----------------
+# ---------------- Main routing
 
 
 def main() -> None:
     if "user_id" not in st.session_state:
         _render_login()
         return
+
+    if _consume_logout_query():
+        st.rerun()
 
     models = _cached_models()
     page, active_model, active_assignment = _sidebar(models)
