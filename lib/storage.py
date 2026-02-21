@@ -677,7 +677,61 @@ def set_base_system_prompt(prompt: str) -> None:
 
 
 # ---------------- Conversations ----------------
+import re
 
+_SUFFIX_RE = re.compile(r"^(.*?)(?:\s+(\d+))$")
+
+
+def _conversation_title_exists(user_id: str, title: str) -> bool:
+    title = (title or "").strip()
+    if not title:
+        return False
+
+    if _USE_PG:
+        row = _exec(
+            "SELECT 1 FROM conversations WHERE user_id = %s AND title = %s LIMIT 1",
+            (user_id, title),
+            fetch="one",
+        )
+    else:
+        row = _exec(
+            "SELECT 1 FROM conversations WHERE user_id = ? AND title = ? LIMIT 1",
+            (user_id, title),
+            fetch="one",
+        )
+    return bool(row)
+
+
+def _dedupe_conversation_title(user_id: str, requested_title: str) -> str:
+    title = (requested_title or "").strip() or "New conversation"
+
+    # If it's not taken, keep it.
+    if not _conversation_title_exists(user_id, title):
+        return title
+
+    # If user already asked for something like "New conversation 2"
+    # and "New conversation" exists, then continue from 3, 4, ...
+    base = title
+    n = 2
+    m = _SUFFIX_RE.match(title)
+    if m:
+        base0 = m.group(1).strip()
+        try:
+            n0 = int(m.group(2)) + 1
+        except Exception:
+            n0 = 2
+
+        # Only treat it as a suffix if the base title exists.
+        # (So titles like "HW 2" won't become "HW 3" unless "HW" exists.)
+        if base0 and _conversation_title_exists(user_id, base0):
+            base = base0
+            n = n0
+
+    while True:
+        cand = f"{base} {n}"
+        if not _conversation_title_exists(user_id, cand):
+            return cand
+        n += 1
 
 def create_conversation(
     user_id: str,
@@ -691,6 +745,9 @@ def create_conversation(
     assignment_prompt: Optional[str] = None,
 ) -> int:
     now = _now_iso()
+
+    title = _dedupe_conversation_title(user_id, title)
+
     if _USE_PG:
         row = _exec(
             """
