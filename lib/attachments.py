@@ -18,15 +18,43 @@ class ExtractedFile:
 IMAGE_MIME_PREFIX = "image/"
 
 
-def is_image(mime: str, filename: str) -> bool:
-    mime = (mime or "").lower()
-    if mime.startswith(IMAGE_MIME_PREFIX):
-        return True
+# ---- Compatibility layer (used by app.py imports) ----
+
+def is_image_mime(mime: str) -> bool:
+    """Return True if the mime type is an image."""
+    return (mime or "").lower().startswith(IMAGE_MIME_PREFIX)
+
+
+def detect_kind(filename: str, mime: str) -> str:
+    """Return 'image' or 'file' based on mime and filename."""
     fn = (filename or "").lower()
-    return fn.endswith((".png", ".jpg", ".jpeg", ".webp"))
+    mime_l = (mime or "").lower()
+    if is_image_mime(mime_l) or fn.endswith((".png", ".jpg", ".jpeg", ".webp")):
+        return "image"
+    return "file"
+
+
+def to_data_url(mime: str, data: bytes) -> str:
+    """Convert raw bytes to a data: URL so vision models can receive images inline."""
+    mt = (mime or "").strip() or "application/octet-stream"
+    b64 = base64.b64encode(data or b"").decode("utf-8")
+    return f"data:{mt};base64,{b64}"
+
+
+def extract_text_from_bytes(filename: str, data: bytes, mime: str = "") -> str:
+    """Best-effort text extraction; mime is optional for backward compatibility."""
+    return extract_text_from_file(filename=filename, mime=mime, data=data)
+
+
+# ---- Internals ----
+
+def is_image(mime: str, filename: str) -> bool:
+    """Legacy helper: True if mime/filename indicates an image."""
+    return detect_kind(filename, mime) == "image"
 
 
 def image_bytes_to_b64(data: bytes) -> str:
+    """Base64 encode raw bytes (legacy helper)."""
     return base64.b64encode(data).decode("utf-8")
 
 
