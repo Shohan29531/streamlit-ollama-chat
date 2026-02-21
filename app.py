@@ -75,31 +75,37 @@ st.markdown(
 <style>
   /* Reduce extra top padding */
   section[data-testid="stSidebar"] > div {
-    padding-top: 0.5rem;
+    padding-top: 0.25rem;
   }
-  /* Make the sidebar a bit wider on desktop */
+
+  /* Make the sidebar a bit wider on desktop (no manual margin-left hacks) */
   @media (min-width: 900px) {
     section[data-testid="stSidebar"] {
       width: 360px !important;
+      min-width: 360px !important;
+      max-width: 360px !important;
     }
-    section[data-testid="stSidebar"] + div {
-      margin-left: 360px !important;
+    section[data-testid="stSidebar"] > div {
+      width: 360px !important;
     }
+  }
+
+  /* Use the full main-area width (removes large empty gap on wide screens) */
+  div.block-container {
+    max-width: 100% !important;
+    padding-left: 1.25rem;
+    padding-right: 1.25rem;
   }
 </style>
 """,
     unsafe_allow_html=True,
 )
-
-
 # ---------------- Clipboard button (per-message + whole convo) ----------------
 
 
 def _copy_button(text: str, key: str, tooltip: str = "Copy") -> None:
-    """Render a small copy-to-clipboard button.
-
-    Uses st-copy-button if available; otherwise falls back to a download button.
-    """
+    """Render a small copy-to-clipboard button (no downloads)."""
+    # Primary: st-copy-button component (best UX)
     try:
         from st_copy_button import st_copy_button  # type: ignore
         import inspect
@@ -116,19 +122,44 @@ def _copy_button(text: str, key: str, tooltip: str = "Copy") -> None:
         if "help" in sig.parameters:
             kwargs["help"] = tooltip
         st_copy_button(**kwargs)
+        return
     except Exception:
-        # Fallback: not as nice, but always works.
-        st.download_button(
-            label="📋",
-            data=text,
-            file_name="ds330-chat.txt",
-            mime="text/plain",
-            key=f"dl_{key}",
-            help=tooltip + " (download fallback)",
-        )
+        pass
+
+    # Fallback: lightweight JS copy button (still copies to clipboard; no downloads)
+    try:
+        import streamlit.components.v1 as components
+        import json as _json
+        payload = _json.dumps(text)
+        html = f"""
+        <div style="display:flex;align-items:center;justify-content:flex-end;">
+          <button id="{key}" title="{tooltip}"
+            style="border:none;background:transparent;cursor:pointer;padding:0;margin:0;font-size:16px;line-height:1;">
+            📋
+          </button>
+        </div>
+        <script>
+          const btn = document.getElementById("{key}");
+          btn.addEventListener("click", async () => {{
+            try {{
+              await navigator.clipboard.writeText({payload});
+              const old = btn.textContent;
+              btn.textContent = "✅";
+              setTimeout(() => btn.textContent = old, 900);
+            }} catch (e) {{
+              console.error(e);
+            }}
+          }});
+        </script>
+        """
+        components.html(html, height=26)
+    except Exception:
+        # As a last resort, render nothing (never offer a download fallback).
+        return
 
 
 # ---------------- Cookies / Auth ----------------
+
 
 cookies = EncryptedCookieManager(
     prefix="ds330_chat",
