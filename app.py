@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import requests
 from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
@@ -137,30 +138,32 @@ st.markdown(
     background: rgba(0, 0, 0, 0.03);
   }
 
-  /* Sticky logout section at bottom of sidebar */
-  .ds330-logout-fixed {
-    position: sticky;
-    bottom: 0;
+  
+
+  /* Sidebar: flex column so we can pin logout to bottom */
+@media (min-width: 0px) {
+  section[data-testid="stSidebar"] > div:first-child {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+  }
+  .ds330-sidebar-spacer { flex: 1 1 auto; }
+  .ds330-sidebar-logout-wrap {
     padding-top: 0.75rem;
     padding-bottom: 0.25rem;
-    margin-top: 1rem;
     border-top: 1px solid rgba(0, 0, 0, 0.08);
-    background: var(--background-color);
   }
-  .ds330-logout-link {
-    display: block;
+  .ds330-sidebar-logout-wrap div.stButton > button {
     width: 100%;
-    text-align: center;
-    padding: 0.45rem 0.6rem;
-    border: 1px solid rgba(0, 0, 0, 0.12);
-    border-radius: 10px;
-    text-decoration: none;
-    color: inherit;
+    border: 1px solid rgba(0, 0, 0, 0.12) !important;
+    border-radius: 10px !important;
+    background: rgba(0, 0, 0, 0.02) !important;
   }
-  .ds330-logout-link:hover {
-    border-color: rgba(0, 0, 0, 0.18);
-    background: rgba(0, 0, 0, 0.03);
+  .ds330-sidebar-logout-wrap div.stButton > button:hover {
+    border-color: rgba(0, 0, 0, 0.18) !important;
+    background: rgba(0, 0, 0, 0.04) !important;
   }
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -264,21 +267,6 @@ if "user_id" not in st.session_state:
 
 
 
-def _consume_logout_query() -> bool:
-    """If URL contains ?logout=1, log out and consume the query param."""
-    try:
-        qp = dict(st.query_params)  # Streamlit >= 1.31
-    except Exception:
-        qp = st.experimental_get_query_params()  # type: ignore
-
-    if str(qp.get("logout", ["0"])[0] if isinstance(qp.get("logout"), list) else qp.get("logout", "0")) == "1":
-        _logout()
-        try:
-            st.query_params.clear()
-        except Exception:
-            st.experimental_set_query_params()  # type: ignore
-        return True
-    return False
 
 
 # ---------------- Model list (Ollama Cloud) ----------------
@@ -508,14 +496,13 @@ def _sidebar(models: List[str]) -> Tuple[str, str, Dict[str, Any]]:
     else:
         page = "Chat"
 
-    st.sidebar.markdown(
-        '''
-<div class="ds330-logout-fixed">
-  <a class="ds330-logout-link" href="?logout=1">Logout</a>
-</div>
-''',
-        unsafe_allow_html=True,
-    )
+    # Push logout to the bottom of the sidebar (no query params / no new tab)
+    st.sidebar.markdown('<div class="ds330-sidebar-spacer"></div>', unsafe_allow_html=True)
+    st.sidebar.markdown('<div class="ds330-sidebar-logout-wrap">', unsafe_allow_html=True)
+    if st.sidebar.button("Logout", key="logout_btn", use_container_width=True):
+        _logout()
+        st.rerun()
+    st.sidebar.markdown('</div>', unsafe_allow_html=True)
 
     return page, active_model, active_assignment
 
@@ -603,6 +590,11 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
                     st.session_state["conversation_meta"] = get_conversation(int(conv_id)) or {}
                     st.rerun()
 
+    # Chat title (ChatGPT-style): show model, and show Thinking if enabled
+    if active_model:
+        _title = active_model + (" — Thinking" if DEFAULT_THINK else "")
+        st.markdown(f"# {_title}")
+
     # Render chat history
     msgs = st.session_state.get("messages", [])
     last_assistant_idx = max((i for i, m in enumerate(msgs) if m["role"] == "assistant"), default=-1)
@@ -665,16 +657,28 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
                 ph = st.empty()
                 full = ""
                 payload = _build_payload_messages(int(conv_id))
-                for chunk in chat_stream(
-                    host=OLLAMA_HOST,
-                    api_key=OLLAMA_API_KEY,
-                    model=active_model,
-                    messages=payload,
-                    options=None,
-                    think=DEFAULT_THINK,
-                ):
-                    full += chunk
-                    ph.markdown(full)
+                try:
+                    for chunk in chat_stream(
+                        host=OLLAMA_HOST,
+                        api_key=OLLAMA_API_KEY,
+                        model=active_model,
+                        messages=payload,
+                        options=None,
+                        think=DEFAULT_THINK,
+                    ):
+                        full += chunk
+                        ph.markdown(full)
+                except requests.exceptions.HTTPError as e:
+                    st.error("Model request failed. Check that the model exists in Ollama Cloud and that OLLAMA_HOST / OLLAMA_API_KEY are set correctly.")
+                    st.caption(f"Host: {OLLAMA_HOST} · Model: {active_model}")
+                    with st.expander("Error details", expanded=False):
+                        st.code(str(e))
+                    return
+                except Exception as e:
+                    st.error("Unexpected error while calling the model.")
+                    with st.expander("Error details", expanded=False):
+                        st.code(repr(e))
+                    return
 
             add_message(int(conv_id), "assistant", full)
             touch_conversation(int(conv_id), model=active_model)
@@ -785,16 +789,28 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
     with st.chat_message("assistant"):
         ph = st.empty()
         full = ""
-        for chunk in chat_stream(
-            host=OLLAMA_HOST,
-            api_key=OLLAMA_API_KEY,
-            model=active_model,
-            messages=payload,
-            options=None,
-            think=DEFAULT_THINK,
-        ):
-            full += chunk
-            ph.markdown(full)
+        try:
+            for chunk in chat_stream(
+                host=OLLAMA_HOST,
+                api_key=OLLAMA_API_KEY,
+                model=active_model,
+                messages=payload,
+                options=None,
+                think=DEFAULT_THINK,
+            ):
+                full += chunk
+                ph.markdown(full)
+        except requests.exceptions.HTTPError as e:
+            st.error("Model request failed. Check that the model exists in Ollama Cloud and that OLLAMA_HOST / OLLAMA_API_KEY are set correctly.")
+            st.caption(f"Host: {OLLAMA_HOST} · Model: {active_model}")
+            with st.expander("Error details", expanded=False):
+                st.code(str(e))
+            return
+        except Exception as e:
+            st.error("Unexpected error while calling the model.")
+            with st.expander("Error details", expanded=False):
+                st.code(repr(e))
+            return
 
     asst_id = add_message(int(conv_id), "assistant", full)
 
@@ -979,9 +995,6 @@ def main() -> None:
     if "user_id" not in st.session_state:
         _render_login()
         return
-
-    if _consume_logout_query():
-        st.rerun()
 
     models = _cached_models()
     page, active_model, active_assignment = _sidebar(models)

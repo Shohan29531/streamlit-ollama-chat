@@ -1,7 +1,21 @@
 import json
-from typing import Dict, Iterable, Iterator, List, Optional, Union
+from typing import Any, Dict, Iterable, List, Optional
 
 import requests
+
+
+def _normalize_host(host: str) -> str:
+    host = (host or "").strip()
+    if not host:
+        return host
+    if not host.startswith("http://") and not host.startswith("https://"):
+        # Ollama Cloud endpoints are HTTPS; local Ollama also supports HTTP.
+        host = "https://" + host
+    return host.rstrip("/")
+
+
+def _base_api_url(host: str) -> str:
+    return _normalize_host(host) + "/api"
 
 
 def _headers(api_key: Optional[str]) -> Dict[str, str]:
@@ -11,95 +25,97 @@ def _headers(api_key: Optional[str]) -> Dict[str, str]:
     return h
 
 
-def list_models(host: str, api_key: Optional[str] = None) -> List[str]:
-    """Return available model names from the configured Ollama host."""
-    url = host.rstrip("/") + "/api/tags"
+def list_models(host: str, api_key: Optional[str]) -> List[str]:
+    """List available models from Ollama-compatible /api/tags."""
+    url = _base_api_url(host) + "/tags"
     r = requests.get(url, headers=_headers(api_key), timeout=30)
     r.raise_for_status()
-    data = r.json() or {}
-    models = data.get("models") or []
-    names = [m.get("name") for m in models if m.get("name")]
-    # Stable, predictable ordering
+    data = r.json()
+
+    names: List[str] = []
+    for m in data.get("models", []):
+        nm = m.get("name") or m.get("model")
+        if nm:
+            names.append(nm)
     return sorted(set(names))
 
 
-ThinkParam = Union[bool, str]
+def _raise_with_details(r: requests.Response, url: str) -> None:
+    """Raise an HTTPError with safe, useful details (no secrets)."""
+    snippet = ""
+    try:
+        # Response bodies from Ollama are typically safe JSON error messages.
+        snippet = (r.text or "").strip()
+    except Exception:
+        snippet = ""
+    if len(snippet) > 1500:
+        snippet = snippet[:1500] + "…"
+    msg = f"Ollama API request failed ({r.status_code}) at {url}\n\n{snippet}"
+    raise requests.HTTPError(msg, response=r)
 
 
 def chat_stream(
     host: str,
     api_key: Optional[str],
     model: str,
-    messages: List[Dict],
+    messages: List[Dict[str, Any]],
     stream: bool = True,
-    options: Optional[Dict] = None,
-    think: Optional[ThinkParam] = "high",
-) -> Iterator[str]:
-    """Stream assistant content chunks.
+    options: Optional[Dict[str, Any]] = None,
+    think: Optional[str] = None,
+) -> Iterable[str]:
+    """Stream chat tokens from Ollama-compatible /api/chat.
 
-    Notes:
-    - Some models (e.g., gpt-oss) support a `think` parameter controlling reasoning effort.
-    - When `think` is enabled, Ollama may stream `message.thinking` chunks. We intentionally
-      ignore those and only yield `message.content`.
-
-    Ollama API reference: /api/chat
+    - `think` is an optional vendor extension (e.g., some cloud models).
+    - If the server rejects `think` (400/422), we retry once without it.
     """
-    url = host.rstrip("/") + "/api/chat"
+    url = _base_api_url(host) + "/chat"
 
-    body: Dict = {
-        "model": model,
-        "messages": messages,
-        "stream": stream,
-    }
+    def _do_post(payload: Dict[str, Any]) -> requests.Response:
+        return requests.post(
+            url,
+            headers=_headers(api_key),
+            data=json.dumps(payload),
+            stream=stream,
+            timeout=300,
+        )
+
+    payload: Dict[str, Any] = {"model": model, "messages": messages, "stream": stream}
     if options:
-        body["options"] = options
+        payload["options"] = options
+    if think:
+        payload["think"] = think
 
-    # Enable extended thinking when possible.
-    # - gpt-oss expects think: "low"|"medium"|"high"
-    # - some others may accept think: true
-    if think is not None:
-        body["think"] = think
+    r = _do_post(payload)
 
-    with requests.post(url, headers=_headers(api_key), data=json.dumps(body), stream=True, timeout=300) as r:
-        r.raise_for_status()
-        # Ollama streams JSON lines
-        for line in r.iter_lines(decode_unicode=True):
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
+    # If think isn't supported, retry once without it.
+    if r.status_code in (400, 422) and think:
+        try:
+            body = (r.text or "").lower()
+        except Exception:
+            body = ""
+        # Retry on common validation messages, or just retry once on 400/422.
+        if ("think" in body) or True:
+            r.close()
+            payload.pop("think", None)
+            r = _do_post(payload)
 
-            # ignore server-side progress
-            if obj.get("done"):
-                break
+    if r.status_code >= 400:
+        _raise_with_details(r, url)
 
-            msg = obj.get("message") or {}
-            # When thinking is enabled, message.thinking may be present.
-            # We DO NOT surface it to students.
-            content = msg.get("content")
-            if content:
-                yield content
+    if not stream:
+        data = r.json()
+        msg = (data.get("message") or {}).get("content", "")
+        yield msg
+        return
 
-
-def chat_once(
-    host: str,
-    api_key: Optional[str],
-    model: str,
-    messages: List[Dict],
-    options: Optional[Dict] = None,
-    think: Optional[ThinkParam] = "high",
-) -> str:
-    full = ""
-    for chunk in chat_stream(
-        host=host,
-        api_key=api_key,
-        model=model,
-        messages=messages,
-        stream=True,
-        options=options,
-        think=think,
-    ):
-        full += chunk
-    return full
+    # Streamed responses are newline-delimited JSON objects.
+    for line in r.iter_lines(decode_unicode=True):
+        if not line:
+            continue
+        try:
+            part = json.loads(line)
+        except Exception:
+            continue
+        chunk = (part.get("message") or {}).get("content", "")
+        if chunk:
+            yield chunk
