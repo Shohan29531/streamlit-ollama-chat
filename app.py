@@ -125,7 +125,21 @@ st.markdown(
     border-color: rgba(0, 0, 0, 0.12);
     background: rgba(0, 0, 0, 0.03);
   }
-
+  .ds330-copy-all-btn {
+    font-size: 12px;
+    color: rgba(0, 0, 0, 0.48);          /* grey text */
+    background: transparent;
+    border: 1px solid rgba(0, 0, 0, 0.06); /* very light grey border */
+    padding: 3px 10px;
+    border-radius: 10px;
+    cursor: pointer;
+    line-height: 1.4;
+    }
+  .ds330-copy-all-btn:hover {
+    color: rgba(0, 0, 0, 0.58);
+    border-color: rgba(0, 0, 0, 0.18);
+    background: rgba(0, 0, 0, 0.03);
+  }
 
   
 
