@@ -1,5 +1,6 @@
 # secrets
 .streamlit/secrets.toml
+.streamlit/secrets_server.toml
 
 # local DB / user data
 data/app.db

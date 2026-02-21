@@ -1,809 +1,832 @@
 import os
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
 import streamlit as st
 from streamlit_cookies_manager_ext import EncryptedCookieManager
 
 from lib.ollama_api import chat_stream, list_models
 from lib.render import render_chat_text
 from lib.attachments import (
-    is_image,
-    image_bytes_to_b64,
-    extract_text_from_file,
-    truncate_text,
+    detect_kind,
+    extract_text_from_bytes,
+    is_image_mime,
+    to_data_url,
 )
 from lib.storage import (
     init_db,
-    user_count,
     any_admin_exists,
     upsert_user,
     verify_user,
-    list_users,
-    get_setting,
-    set_setting,
     create_session,
     get_session,
     delete_session,
+    list_users,
+    get_setting,
+    set_setting,
+    get_base_system_prompt,
+    set_base_system_prompt,
+    list_assignments,
+    add_assignment,
+    get_active_assignment,
+    set_active_assignment,
+    update_assignment_prompt,
+    get_assignment,
     create_conversation,
     touch_conversation,
+    get_conversation,
     list_conversations_for_user,
-    list_conversations_with_counts_for_user,
     list_conversations_admin,
     get_conversation_messages,
     add_message,
-    add_attachment,
-    list_attachments_for_message_ids,
     update_message,
     delete_messages_after,
+    add_attachment,
+    list_attachments_for_message_ids,
 )
 
-# ---------------- Config ----------------
-st.set_page_config(page_title="Ollama Chat (Threads + History)", layout="wide")
-init_db()
+# ---------------- App config ----------------
 
-OLLAMA_HOST = st.secrets.get("OLLAMA_HOST", os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
-OLLAMA_API_KEY = st.secrets.get("OLLAMA_API_KEY", os.environ.get("OLLAMA_API_KEY", None))
-BOOTSTRAP_PASSWORD = st.secrets.get("BOOTSTRAP_PASSWORD", "change-this-now")
+APP_NAME = "DS330 Chat"
 
-ACTIVE_MODEL_KEY = "active_model"
-SYSTEM_PROMPT_KEY = "global_system_prompt"
+DEFAULT_BASE_PROMPT = """You are a helpful assistant for DS330. Follow the course rules and be concise, correct, and student-friendly."""
 
-DEFAULT_SYSTEM_PROMPT = "You are a helpful tutor. Be clear, concise, and accurate."
-DEFAULT_MODEL_FALLBACKS = ["gpt-oss:20b", "gpt-oss:20b-cloud"]
-MODEL_ALLOWLIST = st.secrets.get("MODEL_ALLOWLIST", os.environ.get("MODEL_ALLOWLIST", "")).strip()
+# If the model supports it (e.g., gpt-oss), enable extended thinking by default.
+DEFAULT_THINK = "high"  # gpt-oss: low|medium|high
 
 
-@st.cache_data(ttl=600, show_spinner=False)
-def _cached_model_choices(host: str, api_key: str | None):
-    """Cache /api/tags results to avoid re-fetching on every rerun."""
-    return list_models(host, api_key)
+def _secret(key: str, default: Optional[str] = None) -> Optional[str]:
+    if key in st.secrets:
+        v = st.secrets.get(key)
+        return str(v) if v is not None else default
+    return os.environ.get(key, default)
 
 
-# Attachments
-MAX_ATTACHMENTS_PER_MESSAGE = 5
-MAX_TOTAL_UPLOAD_MB = 20
-MAX_FILE_TEXT_CHARS = 12_000
-INCLUDE_FILE_TEXT_LAST_N_USER_MSGS = 3
-INCLUDE_IMAGES_LAST_N_USER_MSGS = 1
+OLLAMA_HOST = _secret("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_API_KEY = _secret("OLLAMA_API_KEY")
 
-# ---------------- Cookies ----------------
-COOKIES_PASSWORD = st.secrets.get(
-    "COOKIES_PASSWORD",
-    os.environ.get("COOKIES_PASSWORD", "change-this-now-too"),
+MODEL_SETTING_KEY = "active_model"
+
+st.set_page_config(page_title=APP_NAME, page_icon="💬", layout="wide")
+
+# Tighten sidebar spacing + slightly widen it
+st.markdown(
+    """
+<style>
+  /* Reduce extra top padding */
+  section[data-testid="stSidebar"] > div {
+    padding-top: 0.5rem;
+  }
+  /* Make the sidebar a bit wider on desktop */
+  @media (min-width: 900px) {
+    section[data-testid="stSidebar"] {
+      width: 360px !important;
+    }
+    section[data-testid="stSidebar"] + div {
+      margin-left: 360px !important;
+    }
+  }
+</style>
+""",
+    unsafe_allow_html=True,
 )
-cookies = EncryptedCookieManager(prefix="streamlit-ollama-chat/", password=COOKIES_PASSWORD)
+
+
+# ---------------- Clipboard button (per-message + whole convo) ----------------
+
+
+def _copy_button(text: str, key: str, tooltip: str = "Copy") -> None:
+    """Render a small copy-to-clipboard button.
+
+    Uses st-copy-button if available; otherwise falls back to a download button.
+    """
+    try:
+        from st_copy_button import st_copy_button  # type: ignore
+        import inspect
+
+        sig = inspect.signature(st_copy_button)
+        kwargs = dict(
+            text=text,
+            before_copy_label="📋",
+            after_copy_label="✅",
+            show_text=False,
+        )
+        if "key" in sig.parameters:
+            kwargs["key"] = key
+        if "help" in sig.parameters:
+            kwargs["help"] = tooltip
+        st_copy_button(**kwargs)
+    except Exception:
+        # Fallback: not as nice, but always works.
+        st.download_button(
+            label="📋",
+            data=text,
+            file_name="ds330-chat.txt",
+            mime="text/plain",
+            key=f"dl_{key}",
+            help=tooltip + " (download fallback)",
+        )
+
+
+# ---------------- Cookies / Auth ----------------
+
+cookies = EncryptedCookieManager(
+    prefix="ds330_chat",
+    password=_secret("COOKIE_PASSWORD", "change-me"),
+)
+
 if not cookies.ready():
     st.stop()
-COOKIE_SESSION_KEY = "session_token"
 
 
-def load_active_model() -> str:
-    return get_setting(ACTIVE_MODEL_KEY, DEFAULT_MODEL_FALLBACKS[0])
+def _login(user_id: str, role: str) -> None:
+    token = create_session(user_id, role)
+    cookies["session_token"] = token
+    cookies.save()
+    st.session_state["user_id"] = user_id
+    st.session_state["role"] = role
+    st.session_state["session_token"] = token
 
 
-def load_system_prompt() -> str:
-    return get_setting(SYSTEM_PROMPT_KEY, DEFAULT_SYSTEM_PROMPT)
+def _logout() -> None:
+    token = st.session_state.get("session_token") or cookies.get("session_token")
+    if token:
+        try:
+            delete_session(token)
+        except Exception:
+            pass
+    cookies["session_token"] = ""
+    cookies.save()
+    for k in ["user_id", "role", "session_token", "conversation_id", "messages", "conversation_meta"]:
+        st.session_state.pop(k, None)
 
 
-def logout():
-    tok = st.session_state.get("session_token") or cookies.get(COOKIE_SESSION_KEY)
-    if tok:
-        delete_session(tok)
+# ---------------- DB init ----------------
+
+init_db()
+
+
+# ---------------- Session restore ----------------
+
+if "user_id" not in st.session_state:
+    token = cookies.get("session_token")
+    if token:
+        sess = get_session(token)
+        if sess:
+            st.session_state["user_id"] = sess["user_id"]
+            st.session_state["role"] = sess["role"]
+            st.session_state["session_token"] = sess["token"]
+
+
+# ---------------- Model list (Ollama Cloud) ----------------
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_models() -> List[str]:
     try:
-        if cookies.get(COOKIE_SESSION_KEY) is not None:
-            del cookies[COOKIE_SESSION_KEY]
-            cookies.save()
+        return list_models(OLLAMA_HOST, OLLAMA_API_KEY)
     except Exception:
-        pass
-
-    st.session_state.auth = None
-    st.session_state.session_token = None
-    st.session_state.chat = []
-    st.session_state.conversation_id = None
-    st.session_state.draft_title = ""
-    st.session_state.attachments_uploader = []
-    st.session_state.editing_msg_id = None
-    st.session_state.editing_idx = None
-    st.session_state.editing_text = ""
-    st.rerun()
+        return []
 
 
-def _render_attachments(attachments, key_prefix: str = "att"):
-    """Render image/file attachments under a chat message."""
+def _load_active_model(models: List[str]) -> str:
+    saved = get_setting(MODEL_SETTING_KEY, None)
+    if saved and saved in models:
+        return saved
+    if models:
+        set_setting(MODEL_SETTING_KEY, models[0])
+        return models[0]
+    return ""
+
+
+# ---------------- Prompts / Assignments ----------------
+
+
+def _combined_prompt(base_prompt: str, assignment_prompt: str) -> str:
+    base = (base_prompt or "").strip()
+    ap = (assignment_prompt or "").strip()
+    if not base:
+        base = DEFAULT_BASE_PROMPT.strip()
+    return base + ("\n\n" + ap if ap else "")
+
+
+def _active_assignment_label() -> str:
+    a = get_active_assignment()
+    return a.get("name") or "(no assignment)"
+
+
+# ---------------- Helpers ----------------
+
+
+def _load_conversation_into_state(conversation_id: int) -> None:
+    conv = get_conversation(conversation_id)
+    if not conv:
+        st.session_state.pop("conversation_id", None)
+        st.session_state["messages"] = []
+        st.session_state["conversation_meta"] = {}
+        return
+
+    msgs = get_conversation_messages(conversation_id)
+    # Attachments
+    mids = [m["id"] for m in msgs]
+    att_map = list_attachments_for_message_ids(mids)
+
+    ui_msgs: List[Dict[str, Any]] = []
+    for m in msgs:
+        ui_msgs.append(
+            {
+                "id": m["id"],
+                "role": m["role"],
+                "content": m["content"],
+                "attachments": att_map.get(m["id"], []),
+            }
+        )
+
+    st.session_state["conversation_id"] = conversation_id
+    st.session_state["messages"] = ui_msgs
+    st.session_state["conversation_meta"] = conv
+
+
+def _conversation_to_text(messages: List[Dict[str, Any]]) -> str:
+    """Plain-text transcript (no images)."""
+    lines: List[str] = []
+    for m in messages:
+        role = "User" if m["role"] == "user" else "Assistant"
+        content = (m.get("content") or "").strip()
+        if not content:
+            continue
+        lines.append(f"{role}: {content}")
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
+def _build_payload_messages(conversation_id: int) -> List[Dict[str, Any]]:
+    """Build messages payload for Ollama /api/chat."""
+    conv = st.session_state.get("conversation_meta") or get_conversation(conversation_id) or {}
+
+    # Prefer per-conversation snapshot prompt (for reproducibility)
+    base_prompt = (conv.get("base_prompt") or "").strip()
+    ap = (conv.get("assignment_prompt") or "").strip()
+    sys_prompt = (conv.get("system_prompt") or "").strip()
+
+    if base_prompt or ap:
+        system_prompt = _combined_prompt(base_prompt, ap)
+    elif sys_prompt:
+        system_prompt = sys_prompt
+    else:
+        # fallback to current global settings
+        base = get_base_system_prompt(DEFAULT_BASE_PROMPT)
+        ap2 = get_active_assignment().get("prompt") or ""
+        system_prompt = _combined_prompt(base, ap2)
+
+    payload: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+
+    for m in st.session_state.get("messages", []):
+        role = m["role"]
+        content = m.get("content") or ""
+
+        if role == "user":
+            # Add images inline for the model
+            blocks: List[Dict[str, Any]] = []
+            if content.strip():
+                blocks.append({"type": "text", "text": content})
+
+            for att in (m.get("attachments") or []):
+                if att.get("kind") == "image" and att.get("data"):
+                    blocks.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": to_data_url(att["mime"], att["data"])},
+                        }
+                    )
+                elif att.get("kind") == "file" and att.get("text_content"):
+                    blocks.append(
+                        {
+                            "type": "text",
+                            "text": f"\n\n[Attached file: {att.get('filename','file')}\n{att.get('text_content','')}]\n",
+                        }
+                    )
+
+            if blocks:
+                payload.append({"role": "user", "content": blocks})
+            else:
+                payload.append({"role": "user", "content": ""})
+        else:
+            payload.append({"role": "assistant", "content": content})
+
+    return payload
+
+
+# ---------------- Login screen ----------------
+
+
+def _render_login() -> None:
+    st.title(APP_NAME)
+
+    if not any_admin_exists():
+        st.info("No admin account exists yet. Create the first admin below.")
+        with st.form("bootstrap_admin"):
+            user_id = st.text_input("Admin user ID")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Create admin")
+        if submitted:
+            if not user_id or not password:
+                st.error("User ID and password are required.")
+            else:
+                upsert_user(user_id, password, "admin")
+                _login(user_id, "admin")
+                st.rerun()
+        return
+
+    st.subheader("Sign in")
+    with st.form("login_form"):
+        user_id = st.text_input("User ID")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Login")
+
+    if submitted:
+        auth = verify_user(user_id, password)
+        if not auth:
+            st.error("Invalid credentials")
+            return
+        _login(auth["user_id"], auth["role"])
+        st.rerun()
+
+
+# ---------------- Sidebar ----------------
+
+
+def _sidebar(models: List[str]) -> Tuple[str, str, Dict[str, Any]]:
+    user_id = st.session_state["user_id"]
+    role = st.session_state["role"]
+    is_admin = role == "admin"
+
+    st.sidebar.markdown(f"### {APP_NAME}")
+    st.sidebar.caption(f"Signed in as **{user_id}** ({role})")
+
+    # Active assignment (students can see; admin can change)
+    active_assignment = get_active_assignment()
+    st.sidebar.caption(f"**Active assignment:** {active_assignment.get('name')}")
+
+    # Model selection
+    active_model = _load_active_model(models)
+    if is_admin:
+        if models:
+            sel = st.sidebar.selectbox("Active model", models, index=models.index(active_model))
+            if sel != active_model:
+                set_setting(MODEL_SETTING_KEY, sel)
+                active_model = sel
+        else:
+            st.sidebar.warning("No models found. Check OLLAMA_HOST / API key.")
+
+        # Assignment selection (admin only)
+        assignments = list_assignments()
+        if assignments:
+            id_to_name = {int(a["id"]): a["name"] for a in assignments}
+            ids = list(id_to_name.keys())
+            active_id = int(active_assignment["id"])
+            idx = ids.index(active_id) if active_id in ids else 0
+            new_id = st.sidebar.selectbox(
+                "Set active assignment",
+                ids,
+                format_func=lambda i: id_to_name.get(int(i), str(i)),
+                index=idx,
+            )
+            if int(new_id) != active_id:
+                set_active_assignment(int(new_id))
+                st.rerun()
+
+    else:
+        st.sidebar.caption(f"**Active model:** {active_model}")
+
+    st.sidebar.divider()
+    page = st.sidebar.radio("", ["Chat", "Admin Dashboard"] if is_admin else ["Chat"], index=0, key="nav_page")
+
+    st.sidebar.divider()
+    if st.sidebar.button("Logout"):
+        _logout()
+        st.rerun()
+
+    return page, active_model, active_assignment
+
+
+# ---------------- Chat UI ----------------
+
+
+def _render_attachments(attachments: List[Dict[str, Any]]) -> None:
     if not attachments:
         return
 
-    images = [a for a in attachments if a.get("kind") == "image"]
+    images = [a for a in attachments if a.get("kind") == "image" and a.get("data")]
     files = [a for a in attachments if a.get("kind") == "file"]
 
     if images:
-        for j, a in enumerate(images):
-            st.image(a.get("data"), caption=a.get("filename"), use_column_width=True)
+        st.caption("Attachments")
+        for img in images:
+            st.image(img["data"], caption=img.get("filename"), use_container_width=True)
 
     if files:
-        for j, a in enumerate(files):
-            fname = a.get("filename")
-            mime = a.get("mime")
-            size_kb = round(len(a.get("data") or b"") / 1024)
-            st.markdown(f"📎 **{fname}**  \\n+_({mime}, {size_kb} KB)_")
-
-            # Download
-            st.download_button(
-                label=f"Download {fname}",
-                data=a.get("data") or b"",
-                file_name=fname,
-                mime=mime or "application/octet-stream",
-                key=f"{key_prefix}_dl_{j}_{fname}",
-            )
-
-            # Preview extracted text if available
-            txt = a.get("text_content")
-            if txt:
-                preview, truncated = truncate_text(txt, 2000)
-                with st.expander(f"Preview extracted text: {fname}", expanded=False):
-                    st.code(preview)
-                    if truncated:
-                        st.caption("(Preview truncated)")
+        st.caption("Attachments")
+        for f in files:
+            name = f.get("filename") or "file"
+            st.markdown(f"- **{name}**")
 
 
-def _build_payload_messages(chat, system_prompt: str):
-    """Convert session chat (with attachments) into Ollama /api/chat messages.
-
-    Policy:
-      - Always send full text history.
-      - Only include extracted file text for the last N *user* messages.
-      - Only include images for the last N *user* messages.
-    """
-    msgs = [{"role": "system", "content": system_prompt}]
-
-    # Identify the last N user messages for file text / images.
-    user_idxs = [i for i, m in enumerate(chat) if m.get("role") == "user"]
-    file_text_allowed = set(user_idxs[-INCLUDE_FILE_TEXT_LAST_N_USER_MSGS :])
-    images_allowed = set(user_idxs[-INCLUDE_IMAGES_LAST_N_USER_MSGS :])
-
-    for i, m in enumerate(chat):
-        role = m.get("role")
-        content = m.get("content") or ""
-
-        if role != "user":
-            msgs.append({"role": role, "content": content})
-            continue
-
-        atts = m.get("attachments") or []
-        file_blocks = []
-        image_b64 = []
-        for a in atts:
-            if a.get("kind") == "file" and i in file_text_allowed:
-                txt = a.get("text_content")
-                if txt:
-                    clipped, _ = truncate_text(txt, MAX_FILE_TEXT_CHARS)
-                    file_blocks.append(f"[Attached file: {a.get('filename')}]\n{clipped}")
-            if a.get("kind") == "image" and i in images_allowed:
-                try:
-                    image_b64.append(image_bytes_to_b64(a.get("data") or b""))
-                except Exception:
-                    pass
-
-        if file_blocks:
-            content = content + "\n\n" + "\n\n".join(file_blocks)
-
-        msg_obj = {"role": "user", "content": content}
-        if image_b64:
-            msg_obj["images"] = image_b64
-        msgs.append(msg_obj)
-
-    return msgs
-
-
-# ---------------- Session State ----------------
-if "auth" not in st.session_state:
-    st.session_state.auth = None
-
-if "session_token" not in st.session_state:
-    st.session_state.session_token = None
-
-if "chat" not in st.session_state:
-    # each item: {"id": int, "role": str, "content": str}
-    st.session_state.chat = []
-
-if "conversation_id" not in st.session_state:
-    st.session_state.conversation_id = None
-
-if "draft_title" not in st.session_state:
-    st.session_state.draft_title = ""
-
-# pending uploads (file_uploader stores its value in session_state)
-if "attachments_uploader" not in st.session_state:
-    st.session_state.attachments_uploader = []
-
-# in-place editing state
-if "editing_msg_id" not in st.session_state:
-    st.session_state.editing_msg_id = None
-if "editing_idx" not in st.session_state:
-    st.session_state.editing_idx = None
-if "editing_text" not in st.session_state:
-    st.session_state.editing_text = ""
-
-
-# ---------------- UI: Title ----------------
-st.title("Ollama Chat")
-
-# ---------------- First-time bootstrap ----------------
-if user_count() == 0 and not any_admin_exists():
-    st.subheader("First-time setup (Create Admin)")
-    st.info("No users exist yet. Create the first admin account.")
-
-    bootstrap_pw = st.text_input("Bootstrap password (from secrets.toml)", type="password")
-    admin_id = st.text_input("New admin ID")
-    admin_pass = st.text_input("New admin password", type="password")
-
-    if st.button("Create Admin"):
-        if bootstrap_pw != BOOTSTRAP_PASSWORD:
-            st.error("Bootstrap password is incorrect.")
-            st.stop()
-        if not admin_id.strip() or not admin_pass:
-            st.error("Admin ID and password are required.")
-            st.stop()
-
-        upsert_user(admin_id.strip(), admin_pass, "admin")
-
-        if not get_setting(SYSTEM_PROMPT_KEY, ""):
-            set_setting(SYSTEM_PROMPT_KEY, DEFAULT_SYSTEM_PROMPT)
-        if not get_setting(ACTIVE_MODEL_KEY, ""):
-            set_setting(ACTIVE_MODEL_KEY, DEFAULT_MODEL_FALLBACKS[0])
-
-        st.success("Admin created. Please login now.")
-    st.stop()
-
-# ---------------- Auto-login from cookie ----------------
-if st.session_state.auth is None:
-    tok = cookies.get(COOKIE_SESSION_KEY)
-    if tok:
-        auth = get_session(tok)
-        if auth:
-            st.session_state.auth = auth
-            st.session_state.session_token = tok
-        else:
-            try:
-                del cookies[COOKIE_SESSION_KEY]
-                cookies.save()
-            except Exception:
-                pass
-
-# ---------------- Login gate ----------------
-if st.session_state.auth is None:
-    st.subheader("Login")
-    user_id = st.text_input("ID")
-    password = st.text_input("Password", type="password")
-
-    if st.button("Login"):
-        auth = verify_user(user_id.strip(), password)
-        if auth:
-            st.session_state.auth = auth
-            tok = create_session(auth["user_id"], auth["role"], days=7)
-            st.session_state.session_token = tok
-            cookies[COOKIE_SESSION_KEY] = tok
-            cookies.save()
-
-            st.session_state.chat = []
-            st.session_state.conversation_id = None
-            st.session_state.draft_title = ""
-            st.session_state.attachments_uploader = []
-            st.session_state.editing_msg_id = None
-            st.session_state.editing_idx = None
-            st.session_state.editing_text = ""
-            st.rerun()
-        else:
-            st.error("Invalid ID or password")
-    st.stop()
-
-current_user = st.session_state.auth["user_id"]
-current_role = st.session_state.auth["role"]
-
-# ---------------- Top bar ----------------
-colL, colR = st.columns([4, 1])
-with colL:
-    st.caption(f"Logged in as: **{current_user}** • Role: **{current_role}**")
-with colR:
-    if st.button("Logout"):
-        logout()
-
-# ---------------- Sidebar: Navigation ----------------
-st.sidebar.title("Navigation")
-if current_role == "student":
-    page = st.sidebar.radio("Page", ["Chat", "My History"], index=0)
-else:
-    page = st.sidebar.radio("Page", ["Chat", "Admin Dashboard"], index=0)
-
-# ---------------- Sidebar: Admin controls ----------------
-st.sidebar.caption(f"Model host: {OLLAMA_HOST}")
-
-if ("ollama.com" in OLLAMA_HOST.lower()) and (not OLLAMA_API_KEY):
-    st.sidebar.error("Missing OLLAMA_API_KEY for Ollama Cloud. Add it in Streamlit Secrets.")
-    model_choices = DEFAULT_MODEL_FALLBACKS
-else:
-    try:
-        model_choices = _cached_model_choices(OLLAMA_HOST, OLLAMA_API_KEY) or DEFAULT_MODEL_FALLBACKS
-    except Exception as e:
-        if "localhost" in OLLAMA_HOST or "127.0.0.1" in OLLAMA_HOST:
-            st.sidebar.warning(
-                "Could not reach the local Ollama server. If this is a Streamlit Cloud deployment, "
-                'set OLLAMA_HOST to "https://ollama.com" and provide OLLAMA_API_KEY in Secrets.'
-            )
-        else:
-            st.sidebar.warning(f"Could not fetch model list: {e}")
-        model_choices = DEFAULT_MODEL_FALLBACKS
-
-# Optional: restrict dropdown to a comma-separated allowlist (useful for classroom deployments)
-if MODEL_ALLOWLIST:
-    allowed = {m.strip() for m in MODEL_ALLOWLIST.split(",") if m.strip()}
-    model_choices = [m for m in model_choices if m in allowed] or model_choices
-
-
-active_model = load_active_model()
-system_prompt = load_system_prompt()
-
-if current_role == "admin":
-    st.sidebar.divider()
-    st.sidebar.subheader("Active Model (Admin-only)")
-    new_model = st.sidebar.selectbox(
-        "Model for everyone",
-        options=model_choices,
-        index=model_choices.index(active_model) if active_model in model_choices else 0,
-    )
-    if st.sidebar.button("Save active model"):
-        set_setting(ACTIVE_MODEL_KEY, new_model)
-        st.toast("Saved active model", icon="✅")
-        st.rerun()
-
-    st.sidebar.subheader("System Prompt (Admin-only)")
-    new_prompt = st.sidebar.text_area("Edit system prompt", value=system_prompt, height=180)
-    if st.sidebar.button("Save system prompt"):
-        set_setting(SYSTEM_PROMPT_KEY, new_prompt)
-        st.toast("Saved system prompt", icon="✅")
-        st.rerun()
-
-    if st.sidebar.button("Reset prompt to code default"):
-        set_setting(SYSTEM_PROMPT_KEY, DEFAULT_SYSTEM_PROMPT)
-        st.toast("Reset to code default", icon="🧹")
-        st.rerun()
-
-    st.sidebar.divider()
-    st.sidebar.subheader("User Management")
-    with st.sidebar.expander("Create / Reset User", expanded=False):
-        u_id = st.text_input("User ID", key="um_user")
-        u_pw = st.text_input("Password", type="password", key="um_pass")
-        u_role = st.selectbox("Role", ["student", "admin"], key="um_role")
-        if st.button("Create/Update user"):
-            if not u_id.strip() or not u_pw:
-                st.sidebar.error("User ID + password required")
-            else:
-                upsert_user(u_id.strip(), u_pw, u_role)
-                st.sidebar.success("User saved")
-
-    with st.sidebar.expander("List users", expanded=False):
-        rows = list_users()
-        for r in rows:
-            st.write(f"- {r['user_id']} ({r['role']})")
-else:
-    st.sidebar.divider()
-    st.sidebar.subheader("Active Model")
-    st.sidebar.write(f"**{active_model}**")
-
-# ---------------- Sidebar: Thread selector (Chat only) ----------------
-if page == "Chat":
-    st.sidebar.divider()
-    st.sidebar.subheader("Conversation Threads")
-
-    threads = list_conversations_for_user(current_user, limit=200)
-    thread_options = ["➕ New conversation"] + [
-        f"#{t['id']} • {t['title'] or '(untitled)'} • {t['updated_at']}"
-        for t in threads
-    ]
-
-    default_index = 0
-    if st.session_state.conversation_id is not None:
-        match = [i for i, t in enumerate(threads, start=1) if t["id"] == st.session_state.conversation_id]
-        if match:
-            default_index = match[0]
-
-    selected = st.sidebar.selectbox("Select a thread", thread_options, index=default_index)
-
-    if selected.startswith("➕"):
-        if st.sidebar.button("Start fresh thread"):
-            st.session_state.conversation_id = None
-            st.session_state.chat = []
-            st.session_state.draft_title = ""
-            st.session_state.attachments_uploader = []
-            st.session_state.editing_msg_id = None
-            st.session_state.editing_idx = None
-            st.session_state.editing_text = ""
-            st.rerun()
+def _render_message(role: str, content: str) -> None:
+    if role == "assistant":
+        render_chat_text(content)
     else:
-        selected_id = int(selected.split("•")[0].strip().lstrip("#"))
-        if selected_id != st.session_state.conversation_id:
-            msgs = get_conversation_messages(selected_id)
-            mid_list = [int(m["id"]) for m in msgs]
-            att_map = list_attachments_for_message_ids(mid_list)
-            st.session_state.conversation_id = selected_id
-            st.session_state.chat = [
-                {
-                    "id": m["id"],
-                    "role": m["role"],
-                    "content": m["content"],
-                    "attachments": att_map.get(int(m["id"]), []),
-                }
-                for m in msgs
-            ]
-            st.session_state.draft_title = ""
-            st.session_state.attachments_uploader = []
-            st.session_state.editing_msg_id = None
-            st.session_state.editing_idx = None
-            st.session_state.editing_text = ""
+        st.markdown(content)
+
+
+def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
+    user_id = st.session_state["user_id"]
+    role = st.session_state["role"]
+    is_admin = role == "admin"
+
+    st.title(APP_NAME)
+
+    # Thread title (saved per conversation)
+    conv_id_existing = st.session_state.get("conversation_id")
+    if conv_id_existing:
+        meta = st.session_state.get("conversation_meta") or {}
+        current_title = meta.get("title") or ""
+        tcols = st.columns([0.75, 0.25])
+        with tcols[0]:
+            new_title = st.text_input("Thread title", value=current_title, key="thread_title")
+        with tcols[1]:
+            if st.button("Save title", key="save_title"):
+                touch_conversation(int(conv_id_existing), title=new_title)
+                st.session_state["conversation_meta"] = get_conversation(int(conv_id_existing)) or {}
+                st.rerun()
+
+        # Snapshot metadata
+        if meta.get("assignment_name"):
+            st.caption(f"This thread uses assignment: **{meta.get('assignment_name')}** · Model: **{meta.get('model')}**")
+
+
+    # Ensure state
+    st.session_state.setdefault("messages", [])
+    st.session_state.setdefault("conversation_meta", {})
+
+    # Sidebar thread picker
+    with st.sidebar:
+        st.markdown("#### Conversations")
+        convs = list_conversations_for_user(user_id)
+        options = [None] + [c["id"] for c in convs]
+        labels = {None: "➕ New conversation"}
+        for c in convs:
+            title = c.get("title") or f"Conversation {c['id']}"
+            # Optional: include assignment tag in list (helps admins)
+            if c.get("assignment_name"):
+                title = f"{title} · {c['assignment_name']}"
+            labels[c["id"]] = title
+
+        current = st.session_state.get("conversation_id")
+        idx = options.index(current) if current in options else 0
+        picked = st.selectbox("", options, index=idx, format_func=lambda x: labels.get(x, str(x)))
+        if picked != current:
+            if picked is None:
+                st.session_state.pop("conversation_id", None)
+                st.session_state["messages"] = []
+                st.session_state["conversation_meta"] = {}
+            else:
+                _load_conversation_into_state(int(picked))
             st.rerun()
 
-    st.sidebar.caption("Students cannot change the model. Admin controls it globally.")
+    # Render chat history
+    msgs = st.session_state.get("messages", [])
+    last_assistant_idx = max((i for i, m in enumerate(msgs) if m["role"] == "assistant"), default=-1)
 
-# ---------------- Page: Chat ----------------
-if page == "Chat":
-    active_model = load_active_model()
-    system_prompt = load_system_prompt()
+    for i, m in enumerate(msgs):
+        with st.chat_message(m["role"]):
+            _render_message(m["role"], m.get("content") or "")
+            _render_attachments(m.get("attachments") or [])
 
-    st.caption(f"Ollama host: {OLLAMA_HOST} • Active model: {active_model}")
+            # Per-message copy button (one per message)
+            ccols = st.columns([0.92, 0.08])
+            with ccols[1]:
+                _copy_button(m.get("content") or "", key=f"copy_msg_{m.get('id','x')}", tooltip="Copy this message")
 
-    st.subheader("Thread Title")
-    st.session_state.draft_title = st.text_input(
-        "Optional (helps you find it later)",
-        value=st.session_state.draft_title,
-        placeholder="e.g., Week 3 Homework Help",
-    )
-
-    # Render chat with small "Edit" action on USER messages
-    for i, msg in enumerate(st.session_state.chat):
-        with st.chat_message(msg["role"]):
-            if msg["role"] == "assistant":
-                render_chat_text(msg["content"])
-            else:
-                st.markdown(msg["content"])
-                _render_attachments(msg.get("attachments"), key_prefix=f"m{msg.get('id')}")
-
-            if msg["role"] == "user" and msg.get("id") is not None and st.session_state.conversation_id is not None:
-                cols = st.columns([1, 9])
-                with cols[0]:
-                    if st.button("✏️ Edit", key=f"edit_btn_{msg['id']}"):
-                        st.session_state.editing_msg_id = msg["id"]
-                        st.session_state.editing_idx = i
-                        st.session_state.editing_text = msg["content"]
-                        st.rerun()
-
-    # --- Edit panel (ChatGPT-like behavior: modify in place, delete later turns, regenerate) ---
-    if st.session_state.editing_msg_id is not None:
-        st.divider()
-        st.subheader("Editing a past prompt")
-        st.caption("Saving will overwrite that prompt, delete all later messages in this thread, and regenerate from there.")
-
-        new_text = st.text_area(
-            "Edit your prompt",
-            value=st.session_state.editing_text,
-            height=160,
-            key="edit_panel_text",
-        )
-
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            if st.button("Save & Regenerate", type="primary"):
-                conv_id = st.session_state.conversation_id
-                msg_id = st.session_state.editing_msg_id
-                idx = st.session_state.editing_idx
-
-                # 1) Update the message in DB
-                update_message(msg_id, new_text)
-
-                # 2) Delete everything after it in DB
-                delete_messages_after(conv_id, msg_id)
-
-                # 3) Truncate session chat and overwrite content in place
-                st.session_state.chat[idx]["content"] = new_text
-                st.session_state.chat = st.session_state.chat[: idx + 1]
-
-                # 4) Regenerate assistant from truncated history
-                payload_messages = _build_payload_messages(st.session_state.chat, system_prompt)
-
-                with st.chat_message("assistant"):
-                    ph = st.empty()
-                    full = ""
-                    try:
-                        for chunk in chat_stream(
-                            host=OLLAMA_HOST,
-                            api_key=OLLAMA_API_KEY,
-                            model=active_model,
-                            messages=payload_messages,
-                            stream=True,
-                        ):
-                            full += chunk
-                            ph.empty()
-                            with ph.container():
-                                render_chat_text(full)
-                    except Exception as e:
-                        st.error(f"Chat failed: {e}")
-                        full = ""
-
-                if full.strip():
-                    asst_id = add_message(conv_id, "assistant", full)
-                    st.session_state.chat.append({"id": asst_id, "role": "assistant", "content": full})
-                    touch_conversation(
-                        conv_id,
-                        title=st.session_state.draft_title.strip() or None,
-                        model=active_model,
-                        system_prompt=system_prompt,
+            # Copy whole conversation (bottom of last assistant response)
+            if i == last_assistant_idx:
+                tcols = st.columns([0.80, 0.20])
+                with tcols[1]:
+                    _copy_button(
+                        _conversation_to_text(msgs),
+                        key=f"copy_conv_{st.session_state.get('conversation_id','new')}",
+                        tooltip="Copy the full conversation (text only)",
                     )
-                    st.toast("Updated + regenerated ✅", icon="✅")
 
-                # clear edit state
-                st.session_state.editing_msg_id = None
-                st.session_state.editing_idx = None
-                st.session_state.editing_text = ""
+            # Conversation edit controls — ADMIN ONLY
+            if is_admin and m["role"] == "user":
+                edit_key = f"edit_btn_{m['id']}"
+                if st.button("✏️ Edit", key=edit_key, help="Edit this user message and regenerate from here"):
+                    st.session_state["editing"] = {
+                        "message_id": m["id"],
+                        "original": m.get("content") or "",
+                        "draft": m.get("content") or "",
+                    }
+                    st.rerun()
+
+    # Admin edit panel (admin only)
+    if is_admin and st.session_state.get("editing"):
+        ed = st.session_state["editing"]
+        st.info("Admin edit mode: update the message and regenerate from that point.")
+        ed["draft"] = st.text_area("Edit user message", value=ed["draft"], height=140)
+        bcols = st.columns([0.25, 0.25, 0.5])
+        if bcols[0].button("Save & Regenerate", type="primary"):
+            conv_id = st.session_state.get("conversation_id")
+            if not conv_id:
+                st.session_state["editing"] = None
                 st.rerun()
 
-        with c2:
-            if st.button("Cancel"):
-                st.session_state.editing_msg_id = None
-                st.session_state.editing_idx = None
-                st.session_state.editing_text = ""
-                st.rerun()
+            update_message(ed["message_id"], ed["draft"])
+            delete_messages_after(int(conv_id), int(ed["message_id"]))
 
-    # Normal input (disable while editing to avoid confusion)
-    if st.session_state.editing_msg_id is None:
-        submission = st.chat_input(
-            "Type your message…",
-            accept_file="multiple",
-            file_type=[
-                "png",
-                "jpg",
-                "jpeg",
-                "webp",
-                "gif",
-                "pdf",
-                "docx",
-                "txt",
-                "md",
-                "csv",
-                "json",
-            ],
-            key="chat_input_box",
-        )
-    else:
-        submission = None
+            # Reload from DB
+            _load_conversation_into_state(int(conv_id))
 
-    if submission:
-        text = (getattr(submission, 'text', '') or '').strip()
-        uploads = list(getattr(submission, 'files', []) or [])
-        if (not text) and uploads:
-            text = 'Please analyze the attached file(s).'
-
-        # ---- Collect attachments selected for this message ----
-        if len(uploads) > MAX_ATTACHMENTS_PER_MESSAGE:
-            st.error(f"Too many attachments. Max is {MAX_ATTACHMENTS_PER_MESSAGE}.")
-            st.stop()
-
-        total_bytes = 0
-        pending_attachments = []
-        for uf in uploads:
-            data = uf.getvalue()
-            total_bytes += len(data)
-            mime = getattr(uf, "type", None) or "application/octet-stream"
-            filename = getattr(uf, "name", "uploaded")
-
-            if is_image(mime, filename):
-                pending_attachments.append(
-                    {
-                        "kind": "image",
-                        "filename": filename,
-                        "mime": mime,
-                        "data": data,
-                        "text_content": None,
-                    }
-                )
-            else:
-                txt = extract_text_from_file(filename, mime, data)
-                pending_attachments.append(
-                    {
-                        "kind": "file",
-                        "filename": filename,
-                        "mime": mime,
-                        "data": data,
-                        "text_content": txt,
-                    }
-                )
-
-        if total_bytes > MAX_TOTAL_UPLOAD_MB * 1024 * 1024:
-            st.error(f"Attachments are too large. Total must be <= {MAX_TOTAL_UPLOAD_MB} MB.")
-            st.stop()
-
-        if st.session_state.conversation_id is None:
-            title = st.session_state.draft_title.strip()
-            if not title:
-                title = (text[:60] or "(untitled)")
-            st.session_state.conversation_id = create_conversation(
-                user_id=current_user,
-                role=current_role,
-                title=title,
-                model=active_model,
-                system_prompt=system_prompt,
-            )
-
-        conv_id = st.session_state.conversation_id
-
-        touch_conversation(
-            conv_id,
-            title=st.session_state.draft_title.strip() or None,
-            model=active_model,
-            system_prompt=system_prompt,
-        )
-
-        user_msg_id = add_message(conv_id, "user", text)
-
-        # Persist attachments (if any)
-        saved_atts = []
-        for a in pending_attachments:
-            try:
-                add_attachment(
-                    message_id=user_msg_id,
-                    kind=a["kind"],
-                    filename=a["filename"],
-                    mime=a["mime"],
-                    data=a["data"],
-                    text_content=a.get("text_content"),
-                    user_id=current_user,
-                    conversation_id=conv_id,
-                )
-            except Exception:
-                # If persistence fails, still allow the chat to proceed.
-                pass
-            saved_atts.append(a)
-
-        st.session_state.chat.append(
-            {"id": user_msg_id, "role": "user", "content": text, "attachments": saved_atts}
-        )
-
-        with st.chat_message("user"):
-            st.markdown(text)
-            _render_attachments(saved_atts, key_prefix=f"send_{user_msg_id}")
-
-        payload_messages = _build_payload_messages(st.session_state.chat, system_prompt)
-
-        with st.chat_message("assistant"):
-            placeholder = st.empty()
-            full = ""
-            try:
+            # Regenerate assistant response
+            with st.chat_message("assistant"):
+                ph = st.empty()
+                full = ""
+                payload = _build_payload_messages(int(conv_id))
                 for chunk in chat_stream(
                     host=OLLAMA_HOST,
                     api_key=OLLAMA_API_KEY,
                     model=active_model,
-                    messages=payload_messages,
-                    stream=True,
+                    messages=payload,
+                    options=None,
+                    think=DEFAULT_THINK,
                 ):
                     full += chunk
-                    placeholder.empty()
-                    with placeholder.container():
-                        render_chat_text(full)
-            except Exception as e:
-                st.error(f"Chat failed: {e}")
-                full = ""
+                    ph.markdown(full)
 
-        if full.strip():
-            asst_id = add_message(conv_id, "assistant", full)
-            st.session_state.chat.append({"id": asst_id, "role": "assistant", "content": full})
-            touch_conversation(
-                conv_id,
-                title=st.session_state.draft_title.strip() or None,
-                model=active_model,
-                system_prompt=system_prompt,
-            )
-            st.toast("Auto-saved ✅", icon="💾")
-
-        # Clear uploader state after send
-        st.session_state.attachments_uploader = []
-
-# ---------------- Page: Student History ----------------
-if page == "My History":
-    st.header("My History")
-    rows = list_conversations_with_counts_for_user(current_user, limit=500)
-    if not rows:
-        st.info("No conversations yet. Go to Chat and start one.")
-    else:
-        options = [
-            f"#{r['id']} • {r['title'] or '(untitled)'} • msgs:{r['msg_count']} • updated:{r['updated_at']}"
-            for r in rows
-        ]
-        sel = st.selectbox("Choose a thread", options)
-
-        conv_id = int(sel.split("•")[0].strip().lstrip("#"))
-        msgs = get_conversation_messages(conv_id)
-        mid_list = [int(m["id"]) for m in msgs]
-        att_map = list_attachments_for_message_ids(mid_list)
-
-        st.subheader(f"Thread #{conv_id}")
-        export_lines = []
-        for m in msgs:
-            with st.chat_message(m["role"]):
-                if m["role"] == "assistant":
-                    render_chat_text(m["content"])
-                else:
-                    st.markdown(m["content"])
-                    _render_attachments(att_map.get(int(m["id"]), []), key_prefix=f"hist_{m['id']}")
-            export_lines.append(f"{m['role'].upper()}: {m['content']}")
-
-        st.download_button(
-            label="Download transcript (.txt)",
-            data="\n\n".join(export_lines),
-            file_name=f"{current_user}_conversation_{conv_id}.txt",
-            mime="text/plain",
-        )
-
-        if st.button("Open this thread in Chat"):
-            st.session_state.conversation_id = conv_id
-            mid_list = [int(m["id"]) for m in msgs]
-            att_map = list_attachments_for_message_ids(mid_list)
-            st.session_state.chat = [
-                {
-                    "id": m["id"],
-                    "role": m["role"],
-                    "content": m["content"],
-                    "attachments": att_map.get(int(m["id"]), []),
-                }
-                for m in msgs
-            ]
-            st.session_state.draft_title = ""
-            st.session_state.attachments_uploader = []
-            st.session_state.editing_msg_id = None
-            st.session_state.editing_idx = None
-            st.session_state.editing_text = ""
+            add_message(int(conv_id), "assistant", full)
+            touch_conversation(int(conv_id), model=active_model)
+            _load_conversation_into_state(int(conv_id))
+            st.session_state["editing"] = None
             st.rerun()
 
-# ---------------- Page: Admin Dashboard ----------------
-if page == "Admin Dashboard":
-    st.header("Admin Dashboard")
+        if bcols[1].button("Cancel"):
+            st.session_state["editing"] = None
+            st.rerun()
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        ufilter = st.text_input("Filter user contains", value="")
-    with col2:
-        rfilter = st.selectbox("Role", ["", "student", "admin"], index=0)
-    with col3:
-        mfilter = st.text_input("Model (exact)", value="")
-
-    rows = list_conversations_admin(
-        user_filter=ufilter or None,
-        role_filter=rfilter or None,
-        model_filter=mfilter or None,
-        limit=300,
+    # Chat input with files (ChatGPT-style)
+    prompt_val = st.chat_input(
+        f"Message {APP_NAME}",
+        accept_file="multiple",
+        file_type=["png", "jpg", "jpeg", "pdf", "txt", "md", "csv", "json", "docx"],
     )
 
-    if not rows:
-        st.write("No saved chats found.")
+    if not prompt_val:
+        return
+
+    # Streamlit returns either string (older versions) or ChatInputValue (newer)
+    if isinstance(prompt_val, str):
+        user_text = prompt_val
+        files = []
     else:
-        options = [
-            f"#{r['id']} • {r['user_id']} • {r['role']} • {r['title'] or '(untitled)'} • {r['model']} • {r['updated_at']}"
-            for r in rows
-        ]
-        sel = st.selectbox("Pick a conversation", options)
-        conv_id = int(sel.split("•")[0].strip().lstrip("#"))
+        user_text = (prompt_val.text or "")
+        files = list(prompt_val.files or [])
 
-        msgs = get_conversation_messages(conv_id)
-        mid_list = [int(m["id"]) for m in msgs]
-        att_map = list_attachments_for_message_ids(mid_list)
-        export_lines = []
-        for m in msgs:
-            with st.chat_message(m["role"]):
-                if m["role"] == "assistant":
-                    render_chat_text(m["content"])
-                else:
-                    st.markdown(m["content"])
-                    _render_attachments(att_map.get(int(m["id"]), []), key_prefix=f"adm_{m['id']}")
-            export_lines.append(f"{m['role'].upper()}: {m['content']}")
+    # Ensure conversation exists
+    conv_id = st.session_state.get("conversation_id")
+    if not conv_id:
+        base_prompt = get_base_system_prompt(DEFAULT_BASE_PROMPT)
+        assignment_prompt = active_assignment.get("prompt") or ""
+        sys_prompt = _combined_prompt(base_prompt, assignment_prompt)
 
-        st.download_button(
-            label="Download transcript (.txt)",
-            data="\n\n".join(export_lines),
-            file_name=f"conversation_{conv_id}.txt",
-            mime="text/plain",
+        conv_id = create_conversation(
+            user_id=user_id,
+            role=role,
+            title="New conversation",
+            model=active_model,
+            system_prompt=sys_prompt,
+            base_prompt=base_prompt,
+            assignment_id=int(active_assignment["id"]),
+            assignment_name=active_assignment.get("name"),
+            assignment_prompt=assignment_prompt,
         )
+        st.session_state["conversation_id"] = conv_id
+        st.session_state["conversation_meta"] = get_conversation(int(conv_id)) or {}
+
+    # Persist user message
+    user_msg_id = add_message(int(conv_id), "user", user_text)
+
+    # Handle files -> attachments
+    attachments: List[Dict[str, Any]] = []
+    for f in files:
+        raw = f.getvalue()
+        mime = getattr(f, "type", "application/octet-stream")
+        filename = getattr(f, "name", "file")
+        kind = "image" if is_image_mime(mime) else "file"
+
+        text_content = None
+        if kind == "file":
+            try:
+                text_content = extract_text_from_bytes(filename, raw)
+            except Exception:
+                text_content = None
+
+        add_attachment(
+            message_id=user_msg_id,
+            kind=kind,
+            filename=filename,
+            mime=mime,
+            data=raw,
+            text_content=text_content,
+        )
+
+        attachments.append(
+            {
+                "kind": kind,
+                "filename": filename,
+                "mime": mime,
+                "data": raw,
+                "text_content": text_content,
+            }
+        )
+
+    # Add to UI state
+    st.session_state["messages"].append(
+        {"id": user_msg_id, "role": "user", "content": user_text, "attachments": attachments}
+    )
+
+    # Render user message
+    with st.chat_message("user"):
+        st.markdown(user_text)
+        _render_attachments(attachments)
+        # per message copy
+        ccols = st.columns([0.92, 0.08])
+        with ccols[1]:
+            _copy_button(user_text, key=f"copy_msg_{user_msg_id}")
+
+    # Build payload and stream assistant
+    payload = _build_payload_messages(int(conv_id))
+    with st.chat_message("assistant"):
+        ph = st.empty()
+        full = ""
+        for chunk in chat_stream(
+            host=OLLAMA_HOST,
+            api_key=OLLAMA_API_KEY,
+            model=active_model,
+            messages=payload,
+            options=None,
+            think=DEFAULT_THINK,
+        ):
+            full += chunk
+            ph.markdown(full)
+
+    asst_id = add_message(int(conv_id), "assistant", full)
+
+    # Update UI state
+    st.session_state["messages"].append(
+        {"id": asst_id, "role": "assistant", "content": full, "attachments": []}
+    )
+
+    touch_conversation(int(conv_id), model=active_model)
+    st.rerun()
+
+
+# ---------------- Admin dashboard ----------------
+
+
+def _admin_dashboard(active_model: str) -> None:
+    st.title("Admin Dashboard")
+
+    # Assignment & prompt editor
+    st.subheader("Assignments & System Prompts")
+
+    active = get_active_assignment()
+    assignments = list_assignments()
+
+    name_by_id = {int(a["id"]): a["name"] for a in assignments}
+    ids = list(name_by_id.keys())
+    idx = ids.index(int(active["id"])) if int(active["id"]) in ids else 0
+
+    c1, c2 = st.columns([0.55, 0.45])
+    with c1:
+        new_active = st.selectbox(
+            "Active assignment",
+            ids,
+            index=idx,
+            format_func=lambda i: name_by_id.get(int(i), str(i)),
+        )
+        if int(new_active) != int(active["id"]):
+            set_active_assignment(int(new_active))
+            st.rerun()
+
+        st.caption(f"Currently editing prompts for: **{get_active_assignment().get('name')}**")
+
+        with st.expander("➕ Add new assignment", expanded=False):
+            new_name = st.text_input("Assignment name", placeholder="Assignment 2")
+            new_prompt = st.text_area("Assignment-specific prompt (optional)", height=160)
+            if st.button("Create assignment"):
+                if not new_name.strip():
+                    st.error("Assignment name is required")
+                else:
+                    aid = add_assignment(new_name.strip(), new_prompt or "")
+                    set_active_assignment(aid)
+                    st.success(f"Created and activated '{new_name.strip()}'")
+                    st.rerun()
+
+    with c2:
+        base_prompt = get_base_system_prompt(DEFAULT_BASE_PROMPT)
+        base_edit = st.text_area(
+            "Base system prompt (applies to ALL assignments)",
+            value=base_prompt,
+            height=320,
+        )
+        if st.button("Save base prompt", type="primary"):
+            set_base_system_prompt(base_edit)
+            st.success("Saved base system prompt")
+
+    # Assignment-specific prompt (full width)
+    active = get_active_assignment()
+    ap_edit = st.text_area(
+        f"Assignment-specific prompt — {active.get('name')}",
+        value=active.get("prompt") or "",
+        height=320,
+    )
+    if st.button("Save assignment prompt"):
+        update_assignment_prompt(int(active["id"]), ap_edit)
+        st.success("Saved assignment prompt")
+
+    st.divider()
+
+    # User management (existing)
+    st.subheader("Users")
+    users = list_users()
+    st.dataframe(users, use_container_width=True, hide_index=True)
+
+    with st.expander("Add / Update user"):
+        uid = st.text_input("User ID", key="new_uid")
+        pw = st.text_input("Password", type="password", key="new_pw")
+        role = st.selectbox("Role", ["student", "admin"], key="new_role")
+        if st.button("Save user"):
+            if not uid or not pw:
+                st.error("User ID and password are required.")
+            else:
+                upsert_user(uid, pw, role)
+                st.success("User saved")
+                st.rerun()
+
+    st.divider()
+
+    # Conversation browser
+    st.subheader("Conversation browser")
+    user_filter = st.text_input("Filter by user_id (contains)", "")
+    model_filter = st.text_input("Filter by model (exact)", "")
+    role_filter = st.selectbox("Filter by role", ["", "student", "admin"], index=0)
+
+    convs = list_conversations_admin(
+        user_filter=user_filter or None,
+        role_filter=role_filter or None,
+        model_filter=model_filter or None,
+        limit=200,
+    )
+
+    if not convs:
+        st.caption("No conversations match filters.")
+        return
+
+    conv_ids = [c["id"] for c in convs]
+    labels = {}
+    for c in convs:
+        cid = c["id"]
+        title = c.get("title") or f"Conversation {cid}"
+        labels[cid] = f"{c.get('updated_at','')} · {c.get('user_id','')} · {title}"
+
+    picked = st.selectbox("Select conversation", conv_ids, format_func=lambda x: labels.get(x, str(x)))
+    conv = get_conversation(int(picked)) or {}
+    msgs = get_conversation_messages(int(picked))
+
+    st.caption(
+        f"Model: **{conv.get('model')}** · Assignment: **{conv.get('assignment_name') or '—'}**"
+    )
+
+    transcript = _conversation_to_text([{**m, "attachments": []} for m in msgs])
+    st.text_area("Transcript (text only)", value=transcript, height=260)
+    _copy_button(transcript, key=f"copy_admin_conv_{picked}", tooltip="Copy transcript")
+
+
+# ---------------- Main routing ----------------
+
+
+def main() -> None:
+    if "user_id" not in st.session_state:
+        _render_login()
+        return
+
+    models = _cached_models()
+    page, active_model, active_assignment = _sidebar(models)
+
+    if page == "Admin Dashboard" and st.session_state.get("role") == "admin":
+        _admin_dashboard(active_model)
+    else:
+        _chat_page(active_model, active_assignment)
+
+
+if __name__ == "__main__":
+    main()

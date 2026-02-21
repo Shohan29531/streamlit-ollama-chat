@@ -1,99 +1,174 @@
 import os
 import secrets
 import sqlite3
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
-from passlib.hash import pbkdf2_sha256
+from passlib.hash import bcrypt
 
-from . import supabase_storage
+# Optional: psycopg (Postgres) for Supabase Postgres
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except Exception:  # pragma: no cover
+    psycopg = None
+    dict_row = None
 
-# Default local SQLite path (used when DATABASE_URL is not set)
-DB_PATH = os.path.join("data", "app.db")
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
-    """Read from Streamlit secrets if available, else env vars."""
-    val = os.environ.get(key)
+    # Streamlit first, then env
     try:
         import streamlit as st  # type: ignore
 
         if key in st.secrets:
-            val = st.secrets.get(key)  # type: ignore
+            v = st.secrets.get(key)
+            return str(v) if v is not None else default
     except Exception:
         pass
-
-    if val is None:
-        return default
-    val = str(val).strip()
-    return val if val else default
+    return os.environ.get(key, default)
 
 
-def _db_url() -> Optional[str]:
-    return _get_secret("DATABASE_URL")
+DATABASE_URL = _get_secret("DATABASE_URL")
+DB_PATH = _get_secret("DB_PATH", "./app.db")
+
+_USE_PG = bool(DATABASE_URL)
+
+# Supabase Storage (optional)
+SUPABASE_URL = _get_secret("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = _get_secret("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_STORAGE_BUCKET = _get_secret("SUPABASE_STORAGE_BUCKET", "ds330-chat-uploads")
+USE_SUPABASE_STORAGE = (
+    _get_secret("USE_SUPABASE_STORAGE", "true").lower() == "true"
+    and bool(SUPABASE_URL)
+    and bool(SUPABASE_SERVICE_ROLE_KEY)
+)
 
 
-def _using_postgres() -> bool:
-    return bool(_db_url())
+# ---------------- Connection helpers ----------------
 
 
-def utc_now() -> str:
-    return datetime.utcnow().isoformat() + "Z"
+@contextmanager
+def _pg_conn():
+    if not psycopg:
+        raise RuntimeError(
+            "psycopg is required for Postgres. Add 'psycopg[binary]' to requirements.txt"
+        )
+    assert DATABASE_URL
+    conn = psycopg.connect(DATABASE_URL, autocommit=True, row_factory=dict_row)  # type: ignore
+    try:
+        yield conn
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
-
-# ---------------- Connections ----------------
 
 def _sqlite_conn() -> sqlite3.Connection:
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    con = sqlite3.connect(DB_PATH, check_same_thread=False)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA foreign_keys=ON")
-    return con
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-def _pg_conn():
-    # Import lazily so local SQLite users don't need psycopg installed.
-    import psycopg
-    from psycopg.rows import dict_row
-
-    url = _db_url()
-    if not url:
-        raise RuntimeError("DATABASE_URL is not set")
-
-    # Supabase pooler transaction mode does not support prepared statements.
-    # Disable prepares to avoid errors when using pooler port 6543.
-    return psycopg.connect(url, row_factory=dict_row, prepare_threshold=0)
+_SQLITE_SINGLETON: Optional[sqlite3.Connection] = None
 
 
-def _conn():
-    return _pg_conn() if _using_postgres() else _sqlite_conn()
+def _sqlite_singleton() -> sqlite3.Connection:
+    global _SQLITE_SINGLETON
+    if _SQLITE_SINGLETON is None:
+        _SQLITE_SINGLETON = _sqlite_conn()
+    return _SQLITE_SINGLETON
 
 
-def _table_columns_sqlite(con: sqlite3.Connection, table: str) -> List[str]:
-    cur = con.cursor()
-    cur.execute(f"PRAGMA table_info({table})")
-    return [r[1] for r in cur.fetchall()]
+def _rows_to_dicts(rows: Iterable[Any]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        if isinstance(r, dict):
+            out.append(r)
+        elif isinstance(r, sqlite3.Row):
+            out.append({k: r[k] for k in r.keys()})
+        else:
+            try:
+                out.append(dict(r))
+            except Exception:
+                out.append({})
+    return out
 
 
-# ---------------- Schema ----------------
+def _exec(sql: str, params: Tuple[Any, ...] = (), fetch: str = "none") -> Any:
+    """Execute SQL against the configured backend.
+
+    fetch: 'none' | 'one' | 'all'
+    """
+    if _USE_PG:
+        with _pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                if fetch == "one":
+                    row = cur.fetchone()
+                    return row
+                if fetch == "all":
+                    return cur.fetchall()
+                return None
+    else:
+        conn = _sqlite_singleton()
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        if fetch == "one":
+            row = cur.fetchone()
+            conn.commit()
+            return row
+        if fetch == "all":
+            rows = cur.fetchall()
+            conn.commit()
+            return rows
+        conn.commit()
+        return None
+
+
+def _has_column(table: str, col: str) -> bool:
+    if _USE_PG:
+        row = _exec(
+            """
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_name = %s AND column_name = %s
+            LIMIT 1
+            """,
+            (table, col),
+            fetch="one",
+        )
+        return bool(row)
+    else:
+        rows = _exec(f"PRAGMA table_info({table})", fetch="all")
+        for r in rows:
+            d = {k: r[k] for k in r.keys()}  # type: ignore
+            if d.get("name") == col:
+                return True
+        return False
+
+
+def _add_column(table: str, col: str, col_type_sql: str) -> None:
+    if _has_column(table, col):
+        return
+    _exec(f"ALTER TABLE {table} ADD COLUMN {col} {col_type_sql}")
+
+
+# ---------------- Schema / init ----------------
+
 
 def init_db() -> None:
-    """Initialize DB schema.
+    """Create tables + apply small migrations.
 
-    - If DATABASE_URL is set: creates tables in Postgres (Supabase).
-    - Otherwise: uses local SQLite.
+    Safe to call on every Streamlit rerun.
     """
-    if _using_postgres():
-        _init_postgres()
-    else:
-        _init_sqlite()
-
-
-def _init_sqlite() -> None:
-    con = _sqlite_conn()
-    cur = con.cursor()
-
-    cur.execute(
+    # users
+    _exec(
         """
         CREATE TABLE IF NOT EXISTS users (
             user_id TEXT PRIMARY KEY,
@@ -103,7 +178,8 @@ def _init_sqlite() -> None:
         """
     )
 
-    cur.execute(
+    # sessions
+    _exec(
         """
         CREATE TABLE IF NOT EXISTS sessions (
             token TEXT PRIMARY KEY,
@@ -115,785 +191,780 @@ def _init_sqlite() -> None:
         """
     )
 
-    cur.execute(
+    # settings
+    _exec(
         """
-        CREATE TABLE IF NOT EXISTS conversations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL,
-            role TEXT NOT NULL,
-            title TEXT NOT NULL DEFAULT '',
-            model TEXT NOT NULL,
-            system_prompt TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
         )
         """
     )
 
-    cur.execute(
+    # assignments
+    _exec(
+        """
+        CREATE TABLE IF NOT EXISTS assignments (
+            id INTEGER PRIMARY KEY,
+            name TEXT UNIQUE NOT NULL,
+            prompt TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+        if not _USE_PG
+        else """
+        CREATE TABLE IF NOT EXISTS assignments (
+            id SERIAL PRIMARY KEY,
+            name TEXT UNIQUE NOT NULL,
+            prompt TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """,
+    )
+
+    # conversations
+    _exec(
+        """
+        CREATE TABLE IF NOT EXISTS conversations (
+            id INTEGER PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            title TEXT,
+            model TEXT,
+            system_prompt TEXT,
+            base_prompt TEXT,
+            assignment_id INTEGER,
+            assignment_name TEXT,
+            assignment_prompt TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+        if not _USE_PG
+        else """
+        CREATE TABLE IF NOT EXISTS conversations (
+            id SERIAL PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            title TEXT,
+            model TEXT,
+            system_prompt TEXT,
+            base_prompt TEXT,
+            assignment_id INTEGER,
+            assignment_name TEXT,
+            assignment_prompt TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """,
+    )
+
+    # messages
+    _exec(
         """
         CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             conversation_id INTEGER NOT NULL,
             role TEXT NOT NULL,
             content TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(conversation_id) REFERENCES conversations(id)
+            created_at TEXT NOT NULL
         )
         """
-    )
-
-    # Attachments: allow either storing bytes in DB (data) OR storing in Supabase (storage_*).
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS attachments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            message_id INTEGER NOT NULL,
-            kind TEXT NOT NULL,
-            filename TEXT NOT NULL,
-            mime TEXT NOT NULL,
-            storage_bucket TEXT,
-            storage_path TEXT,
-            data BLOB,
-            text_content TEXT,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(message_id) REFERENCES messages(id)
-        )
-        """
-    )
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )
-        """
-    )
-
-    con.commit()
-
-    # migrations (safe)
-    try:
-        cols = _table_columns_sqlite(con, "conversations")
-        if "title" not in cols:
-            cur.execute("ALTER TABLE conversations ADD COLUMN title TEXT NOT NULL DEFAULT ''")
-        if "updated_at" not in cols:
-            cur.execute("ALTER TABLE conversations ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
-            cur.execute("UPDATE conversations SET updated_at = created_at WHERE updated_at = ''")
-
-        # attachments migrations (older installs may not have storage_* columns)
-        cols_att = _table_columns_sqlite(con, "attachments")
-        if "storage_bucket" not in cols_att:
-            cur.execute("ALTER TABLE attachments ADD COLUMN storage_bucket TEXT")
-        if "storage_path" not in cols_att:
-            cur.execute("ALTER TABLE attachments ADD COLUMN storage_path TEXT")
-        if "data" not in cols_att:
-            cur.execute("ALTER TABLE attachments ADD COLUMN data BLOB")
-    except Exception:
-        pass
-
-    con.commit()
-    con.close()
-
-
-def _init_postgres() -> None:
-    con = _pg_conn()
-    cur = con.cursor()
-
-    # Note: we store timestamps as ISO strings for compatibility with the existing app logic.
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            user_id TEXT PRIMARY KEY,
-            password_hash TEXT NOT NULL,
-            role TEXT NOT NULL
-        )
-        """
-    )
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS sessions (
-            token TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            role TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL
-        )
-        """
-    )
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS conversations (
-            id BIGSERIAL PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            role TEXT NOT NULL,
-            title TEXT NOT NULL DEFAULT '',
-            model TEXT NOT NULL,
-            system_prompt TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-
-    cur.execute(
-        """
+        if not _USE_PG
+        else """
         CREATE TABLE IF NOT EXISTS messages (
-            id BIGSERIAL PRIMARY KEY,
-            conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            id SERIAL PRIMARY KEY,
+            conversation_id INTEGER NOT NULL,
             role TEXT NOT NULL,
             content TEXT NOT NULL,
             created_at TEXT NOT NULL
         )
-        """
+        """,
     )
 
-    cur.execute(
+    # attachments (either stored inline or in Supabase Storage)
+    _exec(
         """
         CREATE TABLE IF NOT EXISTS attachments (
-            id BIGSERIAL PRIMARY KEY,
-            message_id BIGINT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+            id INTEGER PRIMARY KEY,
+            message_id INTEGER NOT NULL,
             kind TEXT NOT NULL,
-            filename TEXT NOT NULL,
-            mime TEXT NOT NULL,
-            storage_bucket TEXT,
-            storage_path TEXT,
-            data BYTEA,
+            filename TEXT,
+            mime TEXT,
+            data BLOB,
             text_content TEXT,
+            bucket TEXT,
+            path TEXT,
             created_at TEXT NOT NULL
         )
         """
-    )
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
+        if not _USE_PG
+        else """
+        CREATE TABLE IF NOT EXISTS attachments (
+            id SERIAL PRIMARY KEY,
+            message_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            filename TEXT,
+            mime TEXT,
+            data BYTEA,
+            text_content TEXT,
+            bucket TEXT,
+            path TEXT,
+            created_at TEXT NOT NULL
         )
-        """
+        """,
     )
 
-    # Helpful indexes
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_conversations_user_updated ON conversations(user_id, updated_at DESC)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id, id)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_attachments_message_id ON attachments(message_id, id)")
+    # Lightweight migrations for older schemas
+    # conversations new columns
+    _add_column("conversations", "base_prompt", "TEXT")
+    _add_column("conversations", "assignment_id", "INTEGER")
+    _add_column("conversations", "assignment_name", "TEXT")
+    _add_column("conversations", "assignment_prompt", "TEXT")
 
-    con.commit()
-    con.close()
+    # assignments new column (if table existed without prompt)
+    _add_column("assignments", "prompt", "TEXT")
+
+    # attachments storage metadata
+    _add_column("attachments", "bucket", "TEXT")
+    _add_column("attachments", "path", "TEXT")
+
+    # Back-compat migration: move old global prompt into base prompt
+    if get_setting("base_system_prompt", None) is None:
+        old = get_setting("global_system_prompt", None)
+        if old is not None:
+            set_setting("base_system_prompt", old)
+
+    # Ensure at least one assignment + active assignment selection
+    _ensure_default_assignment()
+
+
+def _ensure_default_assignment() -> None:
+    rows = list_assignments()
+    if rows:
+        # active assignment exists?
+        aid = get_setting("active_assignment_id", None)
+        if aid is None:
+            set_setting("active_assignment_id", str(rows[0]["id"]))
+        return
+
+    # Create a default assignment
+    now = _now_iso()
+    if _USE_PG:
+        row = _exec(
+            """
+            INSERT INTO assignments (name, prompt, created_at, updated_at)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id
+            """,
+            ("Assignment 1", "", now, now),
+            fetch="one",
+        )
+        new_id = int(row["id"])  # type: ignore
+    else:
+        _exec(
+            """
+            INSERT INTO assignments (name, prompt, created_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            ("Assignment 1", "", now, now),
+        )
+        row = _exec("SELECT last_insert_rowid() AS id", fetch="one")
+        new_id = int(row["id"])  # type: ignore
+
+    set_setting("active_assignment_id", str(new_id))
 
 
 # ---------------- Settings ----------------
 
-def get_setting(key: str, default: str = "") -> str:
-    if _using_postgres():
-        with _pg_conn() as con:
-            cur = con.cursor()
-            cur.execute("SELECT value FROM settings WHERE key = %s", (key,))
-            row = cur.fetchone()
-            return (row or {}).get("value", default) if row else default
 
-    con = _sqlite_conn()
-    cur = con.cursor()
-    cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
-    row = cur.fetchone()
-    con.close()
-    return row["value"] if row else default
+def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
+    row = _exec("SELECT value FROM settings WHERE key = ?" if not _USE_PG else "SELECT value FROM settings WHERE key = %s", (key,), fetch="one")
+    if not row:
+        return default
+    if isinstance(row, dict):
+        return row.get("value")
+    return row[0]
 
 
 def set_setting(key: str, value: str) -> None:
-    if _using_postgres():
-        with _pg_conn() as con:
-            cur = con.cursor()
-            cur.execute(
-                """
-                INSERT INTO settings(key, value) VALUES(%s, %s)
-                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-                """,
-                (key, value),
-            )
-            con.commit()
-        return
-
-    con = _sqlite_conn()
-    cur = con.cursor()
-    cur.execute(
-        "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (key, value),
-    )
-    con.commit()
-    con.close()
+    if _USE_PG:
+        _exec(
+            """
+            INSERT INTO settings (key, value) VALUES (%s, %s)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """,
+            (key, value),
+        )
+    else:
+        _exec(
+            """
+            INSERT INTO settings (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
 
 
-# ---------------- Users ----------------
+# ---------------- Users / Auth ----------------
+
 
 def user_count() -> int:
-    if _using_postgres():
-        with _pg_conn() as con:
-            cur = con.cursor()
-            cur.execute("SELECT COUNT(*) AS c FROM users")
-            row = cur.fetchone()
-            return int((row or {}).get("c", 0))
-
-    con = _sqlite_conn()
-    cur = con.cursor()
-    cur.execute("SELECT COUNT(*) AS c FROM users")
-    row = cur.fetchone()
-    con.close()
-    return int(row["c"])  # type: ignore[index]
+    row = _exec("SELECT COUNT(*) AS c FROM users", fetch="one")
+    if isinstance(row, dict):
+        return int(row.get("c") or 0)
+    return int(row[0] if row else 0)
 
 
 def any_admin_exists() -> bool:
-    if _using_postgres():
-        with _pg_conn() as con:
-            cur = con.cursor()
-            cur.execute("SELECT 1 FROM users WHERE role='admin' LIMIT 1")
-            return cur.fetchone() is not None
-
-    con = _sqlite_conn()
-    cur = con.cursor()
-    cur.execute("SELECT 1 FROM users WHERE role='admin' LIMIT 1")
-    row = cur.fetchone()
-    con.close()
-    return row is not None
+    row = _exec(
+        "SELECT 1 FROM users WHERE role = ? LIMIT 1" if not _USE_PG else "SELECT 1 FROM users WHERE role = %s LIMIT 1",
+        ("admin",),
+        fetch="one",
+    )
+    return bool(row)
 
 
 def upsert_user(user_id: str, password: str, role: str) -> None:
-    pw_hash = pbkdf2_sha256.hash(password)
-    if _using_postgres():
-        with _pg_conn() as con:
-            cur = con.cursor()
-            cur.execute(
-                """
-                INSERT INTO users(user_id, password_hash, role) VALUES(%s, %s, %s)
-                ON CONFLICT (user_id) DO UPDATE
-                SET password_hash = EXCLUDED.password_hash,
-                    role = EXCLUDED.role
-                """,
-                (user_id, pw_hash, role),
-            )
-            con.commit()
-        return
-
-    con = _sqlite_conn()
-    cur = con.cursor()
-    cur.execute(
-        "INSERT INTO users(user_id, password_hash, role) VALUES(?,?,?) "
-        "ON CONFLICT(user_id) DO UPDATE SET password_hash=excluded.password_hash, role=excluded.role",
-        (user_id, pw_hash, role),
-    )
-    con.commit()
-    con.close()
+    pw_hash = bcrypt.hash(password)
+    if _USE_PG:
+        _exec(
+            """
+            INSERT INTO users (user_id, password_hash, role)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (user_id)
+            DO UPDATE SET password_hash = EXCLUDED.password_hash, role = EXCLUDED.role
+            """,
+            (user_id, pw_hash, role),
+        )
+    else:
+        _exec(
+            """
+            INSERT INTO users (user_id, password_hash, role)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id)
+            DO UPDATE SET password_hash = excluded.password_hash, role = excluded.role
+            """,
+            (user_id, pw_hash, role),
+        )
 
 
 def verify_user(user_id: str, password: str) -> Optional[Dict[str, str]]:
-    if _using_postgres():
-        with _pg_conn() as con:
-            cur = con.cursor()
-            cur.execute("SELECT user_id, password_hash, role FROM users WHERE user_id = %s", (user_id,))
-            row = cur.fetchone()
-        if not row:
-            return None
-        if pbkdf2_sha256.verify(password, row["password_hash"]):
-            return {"user_id": row["user_id"], "role": row["role"]}
-        return None
-
-    con = _sqlite_conn()
-    cur = con.cursor()
-    cur.execute("SELECT user_id, password_hash, role FROM users WHERE user_id = ?", (user_id,))
-    row = cur.fetchone()
-    con.close()
+    row = _exec(
+        "SELECT user_id, password_hash, role FROM users WHERE user_id = ?" if not _USE_PG else "SELECT user_id, password_hash, role FROM users WHERE user_id = %s",
+        (user_id,),
+        fetch="one",
+    )
     if not row:
         return None
-    if pbkdf2_sha256.verify(password, row["password_hash"]):
-        return {"user_id": row["user_id"], "role": row["role"]}
+    d = row if isinstance(row, dict) else {"user_id": row[0], "password_hash": row[1], "role": row[2]}
+    if bcrypt.verify(password, d["password_hash"]):
+        return {"user_id": d["user_id"], "role": d["role"]}
     return None
 
 
-def list_users(limit: int = 200):
-    if _using_postgres():
-        with _pg_conn() as con:
-            cur = con.cursor()
-            cur.execute("SELECT user_id, role FROM users ORDER BY role, user_id LIMIT %s", (limit,))
-            return cur.fetchall()
-
-    con = _sqlite_conn()
-    cur = con.cursor()
-    cur.execute("SELECT user_id, role FROM users ORDER BY role, user_id LIMIT ?", (limit,))
-    rows = cur.fetchall()
-    con.close()
-    return rows
+def list_users() -> List[Dict[str, Any]]:
+    rows = _exec("SELECT user_id, role FROM users ORDER BY user_id", fetch="all")
+    return _rows_to_dicts(rows)
 
 
-# ---------------- Sessions ----------------
-
-def create_session(user_id: str, role: str, days: int = 7) -> str:
-    token = secrets.token_urlsafe(32)
-    now = datetime.utcnow()
-    exp = now + timedelta(days=days)
-
-    if _using_postgres():
-        with _pg_conn() as con:
-            cur = con.cursor()
-            cur.execute(
-                "INSERT INTO sessions(token, user_id, role, created_at, expires_at) VALUES(%s,%s,%s,%s,%s)",
-                (token, user_id, role, now.isoformat() + "Z", exp.isoformat() + "Z"),
-            )
-            con.commit()
-        return token
-
-    con = _sqlite_conn()
-    cur = con.cursor()
-    cur.execute(
-        "INSERT INTO sessions(token, user_id, role, created_at, expires_at) VALUES(?,?,?,?,?)",
-        (token, user_id, role, now.isoformat() + "Z", exp.isoformat() + "Z"),
+def create_session(user_id: str, role: str, hours: int = 12) -> str:
+    token = secrets.token_urlsafe(24)
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(hours=hours)
+    _exec(
+        """
+        INSERT INTO sessions (token, user_id, role, created_at, expires_at)
+        VALUES (?, ?, ?, ?, ?)
+        """ if not _USE_PG else
+        """
+        INSERT INTO sessions (token, user_id, role, created_at, expires_at)
+        VALUES (%s, %s, %s, %s, %s)
+        """,
+        (token, user_id, role, now.isoformat(), expires.isoformat()),
     )
-    con.commit()
-    con.close()
     return token
 
 
-def get_session(token: str) -> Optional[Dict[str, str]]:
-    if _using_postgres():
-        with _pg_conn() as con:
-            cur = con.cursor()
-            cur.execute("SELECT token, user_id, role, expires_at FROM sessions WHERE token = %s", (token,))
-            row = cur.fetchone()
-        if not row:
-            return None
-        exp = datetime.fromisoformat(str(row["expires_at"]).replace("Z", ""))
-        if datetime.utcnow() > exp:
-            delete_session(token)
-            return None
-        return {"user_id": row["user_id"], "role": row["role"]}
-
-    con = _sqlite_conn()
-    cur = con.cursor()
-    cur.execute("SELECT token, user_id, role, expires_at FROM sessions WHERE token = ?", (token,))
-    row = cur.fetchone()
-    con.close()
+def get_session(token: str) -> Optional[Dict[str, Any]]:
+    row = _exec(
+        "SELECT token, user_id, role, expires_at FROM sessions WHERE token = ?" if not _USE_PG else "SELECT token, user_id, role, expires_at FROM sessions WHERE token = %s",
+        (token,),
+        fetch="one",
+    )
     if not row:
         return None
-    exp = datetime.fromisoformat(row["expires_at"].replace("Z", ""))
-    if datetime.utcnow() > exp:
-        delete_session(token)
-        return None
-    return {"user_id": row["user_id"], "role": row["role"]}
+    d = row if isinstance(row, dict) else {"token": row[0], "user_id": row[1], "role": row[2], "expires_at": row[3]}
+    try:
+        exp = datetime.fromisoformat(d["expires_at"])
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        if exp < datetime.now(timezone.utc):
+            delete_session(token)
+            return None
+    except Exception:
+        pass
+    return {"token": d["token"], "user_id": d["user_id"], "role": d["role"]}
 
 
 def delete_session(token: str) -> None:
-    if _using_postgres():
-        with _pg_conn() as con:
-            cur = con.cursor()
-            cur.execute("DELETE FROM sessions WHERE token = %s", (token,))
-            con.commit()
-        return
+    _exec(
+        "DELETE FROM sessions WHERE token = ?" if not _USE_PG else "DELETE FROM sessions WHERE token = %s",
+        (token,),
+    )
 
-    con = _sqlite_conn()
-    cur = con.cursor()
-    cur.execute("DELETE FROM sessions WHERE token = ?", (token,))
-    con.commit()
-    con.close()
+
+# ---------------- Assignments / Prompts ----------------
+
+
+def list_assignments() -> List[Dict[str, Any]]:
+    rows = _exec("SELECT id, name, prompt FROM assignments ORDER BY id", fetch="all")
+    return _rows_to_dicts(rows)
+
+
+def add_assignment(name: str, prompt: str = "") -> int:
+    now = _now_iso()
+    if _USE_PG:
+        row = _exec(
+            """
+            INSERT INTO assignments (name, prompt, created_at, updated_at)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id
+            """,
+            (name, prompt or "", now, now),
+            fetch="one",
+        )
+        return int(row["id"])  # type: ignore
+    else:
+        _exec(
+            """
+            INSERT INTO assignments (name, prompt, created_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (name, prompt or "", now, now),
+        )
+        row = _exec("SELECT last_insert_rowid() AS id", fetch="one")
+        return int(row["id"])  # type: ignore
+
+
+def update_assignment_prompt(assignment_id: int, prompt: str) -> None:
+    now = _now_iso()
+    _exec(
+        "UPDATE assignments SET prompt = ?, updated_at = ? WHERE id = ?" if not _USE_PG else "UPDATE assignments SET prompt = %s, updated_at = %s WHERE id = %s",
+        (prompt or "", now, assignment_id),
+    )
+
+
+def get_assignment(assignment_id: int) -> Optional[Dict[str, Any]]:
+    row = _exec(
+        "SELECT id, name, prompt FROM assignments WHERE id = ?" if not _USE_PG else "SELECT id, name, prompt FROM assignments WHERE id = %s",
+        (assignment_id,),
+        fetch="one",
+    )
+    if not row:
+        return None
+    d = row if isinstance(row, dict) else {"id": row[0], "name": row[1], "prompt": row[2]}
+    return d
+
+
+def get_active_assignment() -> Dict[str, Any]:
+    aid_str = get_setting("active_assignment_id", None)
+    aid = int(aid_str) if aid_str and aid_str.isdigit() else None
+    if aid is not None:
+        a = get_assignment(aid)
+        if a:
+            return a
+
+    # fallback to first assignment
+    rows = list_assignments()
+    if not rows:
+        _ensure_default_assignment()
+        rows = list_assignments()
+
+    a = rows[0]
+    set_setting("active_assignment_id", str(a["id"]))
+    return a
+
+
+def set_active_assignment(assignment_id: int) -> None:
+    set_setting("active_assignment_id", str(int(assignment_id)))
+
+
+def get_base_system_prompt(default: str) -> str:
+    v = get_setting("base_system_prompt", None)
+    return v if (v is not None and v.strip() != "") else default
+
+
+def set_base_system_prompt(prompt: str) -> None:
+    set_setting("base_system_prompt", prompt or "")
 
 
 # ---------------- Conversations ----------------
 
-def create_conversation(user_id: str, role: str, title: str, model: str, system_prompt: str) -> int:
-    now = utc_now()
-    if _using_postgres():
-        with _pg_conn() as con:
-            cur = con.cursor()
-            cur.execute(
-                """
-                INSERT INTO conversations(user_id, role, title, model, system_prompt, created_at, updated_at)
-                VALUES(%s,%s,%s,%s,%s,%s,%s)
-                RETURNING id
-                """,
-                (user_id, role, title, model, system_prompt, now, now),
-            )
-            row = cur.fetchone()
-            con.commit()
-            return int(row["id"])
 
-    con = _sqlite_conn()
-    cur = con.cursor()
-    cur.execute(
-        "INSERT INTO conversations(user_id, role, title, model, system_prompt, created_at, updated_at) VALUES(?,?,?,?,?,?,?)",
-        (user_id, role, title, model, system_prompt, now, now),
-    )
-    conv_id = cur.lastrowid
-    con.commit()
-    con.close()
-    return int(conv_id)
+def create_conversation(
+    user_id: str,
+    role: str,
+    title: str,
+    model: str,
+    system_prompt: str,
+    base_prompt: Optional[str] = None,
+    assignment_id: Optional[int] = None,
+    assignment_name: Optional[str] = None,
+    assignment_prompt: Optional[str] = None,
+) -> int:
+    now = _now_iso()
+    if _USE_PG:
+        row = _exec(
+            """
+            INSERT INTO conversations (
+                user_id, role, title, model, system_prompt,
+                base_prompt, assignment_id, assignment_name, assignment_prompt,
+                created_at, updated_at
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            RETURNING id
+            """,
+            (
+                user_id,
+                role,
+                title,
+                model,
+                system_prompt,
+                base_prompt,
+                assignment_id,
+                assignment_name,
+                assignment_prompt,
+                now,
+                now,
+            ),
+            fetch="one",
+        )
+        return int(row["id"])  # type: ignore
+    else:
+        _exec(
+            """
+            INSERT INTO conversations (
+                user_id, role, title, model, system_prompt,
+                base_prompt, assignment_id, assignment_name, assignment_prompt,
+                created_at, updated_at
+            )
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                user_id,
+                role,
+                title,
+                model,
+                system_prompt,
+                base_prompt,
+                assignment_id,
+                assignment_name,
+                assignment_prompt,
+                now,
+                now,
+            ),
+        )
+        row = _exec("SELECT last_insert_rowid() AS id", fetch="one")
+        return int(row["id"])  # type: ignore
 
 
 def touch_conversation(
     conversation_id: int,
     title: Optional[str] = None,
     model: Optional[str] = None,
+    # system_prompt is optional: by default we DO NOT overwrite snapshot prompts.
     system_prompt: Optional[str] = None,
 ) -> None:
-    fields = []
-    params: List[Any] = []
+    now = _now_iso()
+    sets = ["updated_at = ?" if not _USE_PG else "updated_at = %s"]
+    params: List[Any] = [now]
 
     if title is not None:
-        fields.append("title = %s" if _using_postgres() else "title = ?")
+        sets.append("title = ?" if not _USE_PG else "title = %s")
         params.append(title)
     if model is not None:
-        fields.append("model = %s" if _using_postgres() else "model = ?")
+        sets.append("model = ?" if not _USE_PG else "model = %s")
         params.append(model)
     if system_prompt is not None:
-        fields.append("system_prompt = %s" if _using_postgres() else "system_prompt = ?")
+        sets.append("system_prompt = ?" if not _USE_PG else "system_prompt = %s")
         params.append(system_prompt)
 
-    fields.append("updated_at = %s" if _using_postgres() else "updated_at = ?")
-    params.append(utc_now())
-
-    if _using_postgres():
-        params.append(conversation_id)
-        with _pg_conn() as con:
-            cur = con.cursor()
-            cur.execute(f"UPDATE conversations SET {', '.join(fields)} WHERE id = %s", params)
-            con.commit()
-        return
-
     params.append(conversation_id)
-    con = _sqlite_conn()
-    cur = con.cursor()
-    cur.execute(f"UPDATE conversations SET {', '.join(fields)} WHERE id = ?", params)
-    con.commit()
-    con.close()
 
-
-def list_conversations_for_user(user_id: str, limit: int = 200):
-    if _using_postgres():
-        with _pg_conn() as con:
-            cur = con.cursor()
-            cur.execute(
-                "SELECT * FROM conversations WHERE user_id = %s ORDER BY updated_at DESC LIMIT %s",
-                (user_id, limit),
-            )
-            return cur.fetchall()
-
-    con = _sqlite_conn()
-    cur = con.cursor()
-    cur.execute(
-        "SELECT * FROM conversations WHERE user_id = ? ORDER BY updated_at DESC LIMIT ?",
-        (user_id, limit),
+    sql = (
+        f"UPDATE conversations SET {', '.join(sets)} WHERE id = ?"
+        if not _USE_PG
+        else f"UPDATE conversations SET {', '.join(sets)} WHERE id = %s"
     )
-    rows = cur.fetchall()
-    con.close()
-    return rows
+    _exec(sql, tuple(params))
 
 
-def list_conversations_with_counts_for_user(user_id: str, limit: int = 200):
-    if _using_postgres():
-        with _pg_conn() as con:
-            cur = con.cursor()
-            cur.execute(
-                """
-                SELECT c.*,
-                       (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) AS msg_count
-                FROM conversations c
-                WHERE c.user_id = %s
-                ORDER BY c.updated_at DESC
-                LIMIT %s
-                """,
-                (user_id, limit),
-            )
-            return cur.fetchall()
+def get_conversation(conversation_id: int) -> Optional[Dict[str, Any]]:
+    row = _exec(
+        "SELECT * FROM conversations WHERE id = ?" if not _USE_PG else "SELECT * FROM conversations WHERE id = %s",
+        (conversation_id,),
+        fetch="one",
+    )
+    if not row:
+        return None
+    return row if isinstance(row, dict) else {k: row[k] for k in row.keys()}  # type: ignore
 
-    con = _sqlite_conn()
-    cur = con.cursor()
-    cur.execute(
+
+def list_conversations_for_user(user_id: str, limit: int = 200) -> List[Dict[str, Any]]:
+    rows = _exec(
         """
-        SELECT c.*,
-               (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) AS msg_count
-        FROM conversations c
-        WHERE c.user_id = ?
-        ORDER BY c.updated_at DESC
+        SELECT id, title, updated_at, model, assignment_name
+        FROM conversations
+        WHERE user_id = ?
+        ORDER BY updated_at DESC
         LIMIT ?
+        """ if not _USE_PG else
+        """
+        SELECT id, title, updated_at, model, assignment_name
+        FROM conversations
+        WHERE user_id = %s
+        ORDER BY updated_at DESC
+        LIMIT %s
         """,
         (user_id, limit),
+        fetch="all",
     )
-    rows = cur.fetchall()
-    con.close()
-    return rows
+    return _rows_to_dicts(rows)
+
+
+def list_conversations_with_counts_for_user(user_id: str, limit: int = 500) -> List[Dict[str, Any]]:
+    rows = _exec(
+        """
+        SELECT c.id, c.title, c.updated_at, c.model, COUNT(m.id) AS msg_count
+        FROM conversations c
+        LEFT JOIN messages m ON m.conversation_id = c.id
+        WHERE c.user_id = ?
+        GROUP BY c.id
+        ORDER BY c.updated_at DESC
+        LIMIT ?
+        """ if not _USE_PG else
+        """
+        SELECT c.id, c.title, c.updated_at, c.model, COUNT(m.id) AS msg_count
+        FROM conversations c
+        LEFT JOIN messages m ON m.conversation_id = c.id
+        WHERE c.user_id = %s
+        GROUP BY c.id
+        ORDER BY c.updated_at DESC
+        LIMIT %s
+        """,
+        (user_id, limit),
+        fetch="all",
+    )
+    return _rows_to_dicts(rows)
 
 
 def list_conversations_admin(
     user_filter: Optional[str] = None,
     role_filter: Optional[str] = None,
     model_filter: Optional[str] = None,
-    limit: int = 200,
-):
-    if _using_postgres():
-        q = "SELECT * FROM conversations WHERE 1=1"
-        params: List[Any] = []
-        if user_filter:
-            q += " AND user_id ILIKE %s"
-            params.append(f"%{user_filter}%")
-        if role_filter:
-            q += " AND role = %s"
-            params.append(role_filter)
-        if model_filter:
-            q += " AND model = %s"
-            params.append(model_filter)
-        q += " ORDER BY updated_at DESC LIMIT %s"
-        params.append(limit)
+    limit: int = 300,
+) -> List[Dict[str, Any]]:
+    where = []
+    params: List[Any] = []
 
-        with _pg_conn() as con:
-            cur = con.cursor()
-            cur.execute(q, params)
-            return cur.fetchall()
-
-    con = _sqlite_conn()
-    cur = con.cursor()
-    q = "SELECT * FROM conversations WHERE 1=1"
-    params2: List[Any] = []
     if user_filter:
-        q += " AND user_id LIKE ?"
-        params2.append(f"%{user_filter}%")
+        where.append("user_id LIKE ?" if not _USE_PG else "user_id ILIKE %s")
+        params.append(f"%{user_filter}%")
     if role_filter:
-        q += " AND role = ?"
-        params2.append(role_filter)
+        where.append("role = ?" if not _USE_PG else "role = %s")
+        params.append(role_filter)
     if model_filter:
-        q += " AND model = ?"
-        params2.append(model_filter)
-    q += " ORDER BY updated_at DESC LIMIT ?"
-    params2.append(limit)
-    cur.execute(q, params2)
-    rows = cur.fetchall()
-    con.close()
-    return rows
+        where.append("model = ?" if not _USE_PG else "model = %s")
+        params.append(model_filter)
+
+    wsql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    sql = (
+        f"SELECT id, user_id, role, title, model, updated_at FROM conversations {wsql} ORDER BY updated_at DESC LIMIT ?"
+        if not _USE_PG
+        else f"SELECT id, user_id, role, title, model, updated_at FROM conversations {wsql} ORDER BY updated_at DESC LIMIT %s"
+    )
+
+    params.append(limit)
+    rows = _exec(sql, tuple(params), fetch="all")
+    return _rows_to_dicts(rows)
 
 
 # ---------------- Messages ----------------
 
-def add_message(conversation_id: int, role: str, content: str) -> int:
-    if _using_postgres():
-        with _pg_conn() as con:
-            cur = con.cursor()
-            cur.execute(
-                "INSERT INTO messages(conversation_id, role, content, created_at) VALUES(%s,%s,%s,%s) RETURNING id",
-                (conversation_id, role, content, utc_now()),
-            )
-            row = cur.fetchone()
-            con.commit()
-            return int(row["id"])
 
-    con = _sqlite_conn()
-    cur = con.cursor()
-    cur.execute(
-        "INSERT INTO messages(conversation_id, role, content, created_at) VALUES(?,?,?,?)",
-        (conversation_id, role, content, utc_now()),
-    )
-    msg_id = cur.lastrowid
-    con.commit()
-    con.close()
-    return int(msg_id)
-
-
-def get_conversation_messages(conversation_id: int):
-    if _using_postgres():
-        with _pg_conn() as con:
-            cur = con.cursor()
-            cur.execute(
-                "SELECT id, role, content, created_at FROM messages WHERE conversation_id = %s ORDER BY id ASC",
-                (conversation_id,),
-            )
-            return cur.fetchall()
-
-    con = _sqlite_conn()
-    cur = con.cursor()
-    cur.execute(
-        "SELECT id, role, content, created_at FROM messages WHERE conversation_id = ? ORDER BY id ASC",
+def get_conversation_messages(conversation_id: int) -> List[Dict[str, Any]]:
+    rows = _exec(
+        "SELECT id, role, content, created_at FROM messages WHERE conversation_id = ? ORDER BY id ASC" if not _USE_PG
+        else "SELECT id, role, content, created_at FROM messages WHERE conversation_id = %s ORDER BY id ASC",
         (conversation_id,),
+        fetch="all",
     )
-    rows = cur.fetchall()
-    con.close()
-    return rows
+    return _rows_to_dicts(rows)
 
 
-def update_message(message_id: int, new_content: str) -> None:
-    if _using_postgres():
-        with _pg_conn() as con:
-            cur = con.cursor()
-            cur.execute("UPDATE messages SET content = %s WHERE id = %s", (new_content, message_id))
-            con.commit()
-        return
+def add_message(conversation_id: int, role: str, content: str) -> int:
+    now = _now_iso()
+    if _USE_PG:
+        row = _exec(
+            """
+            INSERT INTO messages (conversation_id, role, content, created_at)
+            VALUES (%s,%s,%s,%s)
+            RETURNING id
+            """,
+            (conversation_id, role, content, now),
+            fetch="one",
+        )
+        return int(row["id"])  # type: ignore
+    else:
+        _exec(
+            """
+            INSERT INTO messages (conversation_id, role, content, created_at)
+            VALUES (?,?,?,?)
+            """,
+            (conversation_id, role, content, now),
+        )
+        row = _exec("SELECT last_insert_rowid() AS id", fetch="one")
+        return int(row["id"])  # type: ignore
 
-    con = _sqlite_conn()
-    cur = con.cursor()
-    cur.execute("UPDATE messages SET content = ? WHERE id = ?", (new_content, message_id))
-    con.commit()
-    con.close()
+
+def update_message(message_id: int, content: str) -> None:
+    _exec(
+        "UPDATE messages SET content = ? WHERE id = ?" if not _USE_PG else "UPDATE messages SET content = %s WHERE id = %s",
+        (content, message_id),
+    )
 
 
 def delete_messages_after(conversation_id: int, message_id: int) -> None:
-    if _using_postgres():
-        with _pg_conn() as con:
-            cur = con.cursor()
-            cur.execute("DELETE FROM messages WHERE conversation_id = %s AND id > %s", (conversation_id, message_id))
-            con.commit()
-        return
+    # Delete attachments for deleted messages first
+    rows = _exec(
+        "SELECT id FROM messages WHERE conversation_id = ? AND id > ?" if not _USE_PG
+        else "SELECT id FROM messages WHERE conversation_id = %s AND id > %s",
+        (conversation_id, message_id),
+        fetch="all",
+    )
+    msg_ids = [int(r["id"]) if isinstance(r, dict) else int(r[0]) for r in rows]  # type: ignore
+    if msg_ids:
+        placeholders = ",".join(["?"] * len(msg_ids)) if not _USE_PG else ",".join(["%s"] * len(msg_ids))
+        _exec(
+            f"DELETE FROM attachments WHERE message_id IN ({placeholders})" if not _USE_PG else f"DELETE FROM attachments WHERE message_id IN ({placeholders})",
+            tuple(msg_ids),
+        )
 
-    con = _sqlite_conn()
-    cur = con.cursor()
-    cur.execute("DELETE FROM messages WHERE conversation_id = ? AND id > ?", (conversation_id, message_id))
-    con.commit()
-    con.close()
+    _exec(
+        "DELETE FROM messages WHERE conversation_id = ? AND id > ?" if not _USE_PG
+        else "DELETE FROM messages WHERE conversation_id = %s AND id > %s",
+        (conversation_id, message_id),
+    )
 
 
 # ---------------- Attachments ----------------
 
+
+def _supabase_client():
+    if not USE_SUPABASE_STORAGE:
+        return None
+    try:
+        from lib import supabase_storage  # type: ignore
+
+        return supabase_storage
+    except Exception:
+        return None
+
+
 def add_attachment(
-    *,
     message_id: int,
     kind: str,
     filename: str,
     mime: str,
     data: bytes,
     text_content: Optional[str] = None,
-    user_id: Optional[str] = None,
-    conversation_id: Optional[int] = None,
-) -> int:
+) -> None:
     """Persist an attachment.
 
-    If Supabase Storage is configured, uploads to Storage and stores storage_bucket/path.
-    Otherwise stores raw bytes in DB (SQLite BLOB or Postgres BYTEA).
-
-    NOTE: For Storage uploads, you should pass user_id and conversation_id to generate structured paths.
+    If Supabase Storage is configured, binary data is uploaded there and only metadata is stored in Postgres.
+    Otherwise, binary data is stored inline (SQLite BLOB / Postgres BYTEA).
     """
-    now = utc_now()
+    now = _now_iso()
 
-    storage_bucket: Optional[str] = None
-    storage_path: Optional[str] = None
-    blob: Optional[bytes] = data
+    bucket = None
+    path = None
+    blob = data
 
-    if supabase_storage.is_enabled():
-        if user_id is None or conversation_id is None:
-            raise ValueError("user_id and conversation_id are required when Supabase Storage is enabled")
-        storage_bucket, storage_path = supabase_storage.upload_bytes(
-            user_id=user_id,
-            conversation_id=conversation_id,
-            message_id=message_id,
-            filename=filename,
-            mime=mime,
+    sb = _supabase_client()
+    if sb is not None:
+        # upload under a deterministic prefix
+        safe_name = filename.replace("/", "_")
+        path = f"m{message_id}/{secrets.token_urlsafe(8)}-{safe_name}"
+        sb.upload_bytes(
+            supabase_url=SUPABASE_URL,
+            service_role_key=SUPABASE_SERVICE_ROLE_KEY,
+            bucket=SUPABASE_STORAGE_BUCKET,
+            path=path,
             data=data,
+            content_type=mime or "application/octet-stream",
         )
-        blob = None  # do not duplicate bytes in DB
+        bucket = SUPABASE_STORAGE_BUCKET
+        blob = None
 
-    if _using_postgres():
-        with _pg_conn() as con:
-            cur = con.cursor()
-            cur.execute(
-                """
-                INSERT INTO attachments(message_id, kind, filename, mime, storage_bucket, storage_path, data, text_content, created_at)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                RETURNING id
-                """,
-                (message_id, kind, filename, mime, storage_bucket, storage_path, blob, text_content, now),
-            )
-            row = cur.fetchone()
-            con.commit()
-            return int(row["id"])
-
-    con = _sqlite_conn()
-    cur = con.cursor()
-    cur.execute(
+    _exec(
         """
-        INSERT INTO attachments(message_id, kind, filename, mime, storage_bucket, storage_path, data, text_content, created_at)
-        VALUES(?,?,?,?,?,?,?,?,?)
+        INSERT INTO attachments (message_id, kind, filename, mime, data, text_content, bucket, path, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?)
+        """ if not _USE_PG else
+        """
+        INSERT INTO attachments (message_id, kind, filename, mime, data, text_content, bucket, path, created_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """,
-        (
-            message_id,
-            kind,
-            filename,
-            mime,
-            storage_bucket,
-            storage_path,
-            sqlite3.Binary(blob) if blob is not None else None,
-            text_content,
-            now,
-        ),
+        (message_id, kind, filename, mime, blob, text_content, bucket, path, now),
     )
-    att_id = cur.lastrowid
-    con.commit()
-    con.close()
-    return int(att_id)
 
 
 def list_attachments_for_message_ids(message_ids: List[int]) -> Dict[int, List[Dict[str, Any]]]:
-    """Return mapping message_id -> list of attachment dicts.
-
-    Attachment dict includes raw bytes under key 'data'. If bytes are stored in Supabase Storage,
-    this function downloads them server-side.
-    """
     if not message_ids:
         return {}
 
-    rows: List[Any]
-    if _using_postgres():
-        with _pg_conn() as con:
-            cur = con.cursor()
-            cur.execute(
-                """
-                SELECT id, message_id, kind, filename, mime, storage_bucket, storage_path, data, text_content, created_at
-                FROM attachments
-                WHERE message_id = ANY(%s::bigint[])
-                ORDER BY id ASC
-                """,
-                (message_ids,),
-            )
-            rows = cur.fetchall()
-    else:
-        con = _sqlite_conn()
-        cur = con.cursor()
-        placeholders = ",".join(["?"] * len(message_ids))
-        cur.execute(
-            f"""
-            SELECT id, message_id, kind, filename, mime, storage_bucket, storage_path, data, text_content, created_at
-            FROM attachments
-            WHERE message_id IN ({placeholders})
-            ORDER BY id ASC
-            """,
-            message_ids,
-        )
-        rows = cur.fetchall()
-        con.close()
+    placeholders = ",".join(["?"] * len(message_ids)) if not _USE_PG else ",".join(["%s"] * len(message_ids))
+    rows = _exec(
+        f"SELECT id, message_id, kind, filename, mime, data, text_content, bucket, path FROM attachments WHERE message_id IN ({placeholders}) ORDER BY id ASC",
+        tuple(message_ids),
+        fetch="all",
+    )
 
     out: Dict[int, List[Dict[str, Any]]] = {}
-    for r in rows:
-        mid = int(r["message_id"]) if isinstance(r, dict) else int(r["message_id"])  # sqlite Row acts like dict
-        bucket = r.get("storage_bucket") if isinstance(r, dict) else r["storage_bucket"]
-        path = r.get("storage_path") if isinstance(r, dict) else r["storage_path"]
-        blob = r.get("data") if isinstance(r, dict) else r["data"]
+    sb = _supabase_client()
 
-        data_bytes: bytes = b""
-        if blob is not None:
-            data_bytes = bytes(blob)
-        elif bucket and path and supabase_storage.is_enabled():
+    for r in _rows_to_dicts(rows):
+        mid = int(r["message_id"])
+        data = r.get("data")
+
+        # psycopg returns memoryview for bytea
+        if isinstance(data, memoryview):
+            data = data.tobytes()
+
+        if data is None and sb is not None and r.get("bucket") and r.get("path"):
             try:
-                data_bytes = supabase_storage.download_bytes(bucket, path)
+                data = sb.download_bytes(
+                    supabase_url=SUPABASE_URL,
+                    service_role_key=SUPABASE_SERVICE_ROLE_KEY,
+                    bucket=r["bucket"],
+                    path=r["path"],
+                )
             except Exception:
-                data_bytes = b""
+                data = None
 
         out.setdefault(mid, []).append(
             {
-                "id": int(r["id"]),
+                "id": r.get("id"),
                 "message_id": mid,
-                "kind": r["kind"],
-                "filename": r["filename"],
-                "mime": r["mime"],
-                "storage_bucket": bucket,
-                "storage_path": path,
-                "data": data_bytes,
-                "text_content": r.get("text_content") if isinstance(r, dict) else r["text_content"],
-                "created_at": r["created_at"],
+                "kind": r.get("kind"),
+                "filename": r.get("filename"),
+                "mime": r.get("mime"),
+                "data": data,
+                "text_content": r.get("text_content"),
             }
         )
 

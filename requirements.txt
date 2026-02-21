@@ -1,7 +1,8 @@
-streamlit-cookies-manager-ext==0.1.0
-streamlit>=1.43.0
+streamlit
 requests
 passlib[bcrypt]
+streamlit-cookies-manager-ext
 pypdf
 python-docx
-psycopg[binary]==3.3.2
+psycopg[binary]
+st-copy-button
