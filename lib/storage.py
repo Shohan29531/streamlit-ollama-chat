@@ -6,7 +6,16 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import hmac
-from passlib.hash import bcrypt, pbkdf2_sha256
+from passlib.context import CryptContext
+
+# Password hashing context:
+# - default: bcrypt_sha256 (handles >72-byte passwords safely)
+# - supports legacy bcrypt ($2...) and pbkdf2_sha256
+PWD_CONTEXT = CryptContext(
+    schemes=["bcrypt_sha256", "bcrypt", "pbkdf2_sha256"],
+    deprecated=["bcrypt", "pbkdf2_sha256"],
+)
+
 
 # Optional: psycopg (Postgres) for Supabase Postgres
 try:
@@ -429,7 +438,8 @@ def any_admin_exists() -> bool:
 
 
 def upsert_user(user_id: str, password: str, role: str) -> None:
-    pw_hash = bcrypt.hash(password)
+    # New hashes use bcrypt_sha256 to avoid bcrypt's 72-byte password limit.
+    pw_hash = PWD_CONTEXT.hash(password)
     if _USE_PG:
         _exec(
             """
@@ -452,13 +462,24 @@ def upsert_user(user_id: str, password: str, role: str) -> None:
         )
 
 
+def _bcrypt_truncate_secret(secret: str) -> bytes:
+    """Return <=72-byte secret for legacy bcrypt hashes.
+
+    bcrypt only considers the first 72 bytes; newer bcrypt releases may raise ValueError for longer input.
+    We truncate *bytes* (UTF-8) to mirror bcrypt's behavior.
+    """
+    b = (secret or "").encode("utf-8")
+    return b if len(b) <= 72 else b[:72]
+
+
 def verify_user(user_id: str, password: str) -> Optional[Dict[str, str]]:
     """Verify user credentials.
 
-    Backwards-compatible:
-      - bcrypt hashes (preferred)
-      - legacy pbkdf2_sha256 hashes
-      - legacy plaintext passwords (auto-upgraded to bcrypt on successful login)
+    Supports:
+      - bcrypt_sha256 (preferred; safe for long passwords)
+      - legacy bcrypt ($2a$/$2b$/$2y$...)
+      - legacy pbkdf2_sha256
+      - legacy plaintext (auto-upgraded on successful login)
     """
     row = _exec(
         "SELECT user_id, password_hash, role FROM users WHERE user_id = ?"
@@ -472,11 +493,10 @@ def verify_user(user_id: str, password: str) -> Optional[Dict[str, str]]:
 
     d = row if isinstance(row, dict) else {"user_id": row[0], "password_hash": row[1], "role": row[2]}
     stored = d.get("password_hash")
-
     if stored is None:
         return None
 
-    # Normalize common representations (bytes / byte-literals / whitespace)
+    # Normalize (bytes -> str, strip whitespace, strip b'..' wrapper)
     if isinstance(stored, (bytes, bytearray)):
         stored = stored.decode("utf-8", errors="ignore")
     stored = str(stored).strip()
@@ -484,31 +504,34 @@ def verify_user(user_id: str, password: str) -> Optional[Dict[str, str]]:
         stored = stored[2:-1]
 
     ok = False
+    used_plaintext = False
 
-    # Preferred: bcrypt
-    if stored.startswith("$2"):
+    if stored.startswith("$"):
+        # Hashed formats handled by passlib.
         try:
-            ok = bcrypt.verify(password, stored)
+            ok = PWD_CONTEXT.verify(password, stored)
+        except ValueError as e:
+            # Newer bcrypt releases can raise for long secrets; retry truncated for legacy $2... hashes.
+            if "72" in str(e) and stored.startswith("$2"):
+                try:
+                    ok = PWD_CONTEXT.verify(_bcrypt_truncate_secret(password), stored)
+                except Exception:
+                    ok = False
+            else:
+                ok = False
         except Exception:
             ok = False
-
-    # Legacy: pbkdf2_sha256
-    elif stored.startswith("$pbkdf2-sha256$"):
-        try:
-            ok = pbkdf2_sha256.verify(password, stored)
-        except Exception:
-            ok = False
-
-    # Legacy: plaintext (NOT recommended, but helps when migrating older DBs)
     else:
+        # Legacy plaintext (not recommended)
+        used_plaintext = True
         ok = hmac.compare_digest(password, stored)
 
     if not ok:
         return None
 
-    # Upgrade legacy hashes to bcrypt
-    if not stored.startswith("$2"):
-        new_hash = bcrypt.hash(password)
+    # Upgrade legacy hashes (and plaintext) to the preferred scheme.
+    if used_plaintext or (stored.startswith("$") and PWD_CONTEXT.needs_update(stored)):
+        new_hash = PWD_CONTEXT.hash(password)
         _exec(
             "UPDATE users SET password_hash = ? WHERE user_id = ?"
             if not _USE_PG

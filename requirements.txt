@@ -1,8 +1,16 @@
-streamlit
-requests
-passlib[bcrypt]
-streamlit-cookies-manager-ext
+streamlit>=1.43.0
+requests>=2.31.0
+
+# Auth (pin bcrypt for passlib compatibility)
+passlib==1.7.4
+bcrypt==4.0.1
+
+# Supabase Postgres
+psycopg[binary]==3.3.2
+
+# Cookies
+streamlit-cookies-manager-ext==0.1.0
+
+# File text extraction
 pypdf
 python-docx
-psycopg[binary]
-st-copy-button
