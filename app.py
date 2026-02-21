@@ -125,7 +125,7 @@ st.markdown(
     border-color: rgba(0, 0, 0, 0.12);
     background: rgba(0, 0, 0, 0.03);
   }
-  .ds330-copy-all-btn {
+.ds330-copy-all-btn {
     font-size: 12px;
     color: rgba(0, 0, 0, 0.48);          /* grey text */
     background: transparent;
@@ -564,7 +564,7 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
     title = f"{active_model}"
     if DEFAULT_THINK:
         title += " — Thinking"
-    st.markdown("DS330 Chat Assistant")
+    st.markdown("## DS330 Chat Assistant")
 
     # Sidebar thread picker
     with st.sidebar:
