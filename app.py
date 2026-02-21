@@ -99,25 +99,41 @@ st.markdown(
     padding-top: 0.75rem !important;
   }
 
-  /* Subtle copy buttons (hoverable) */
+  /* Copy buttons (ChatGPT-like subtle) */
   .ds330-copy-wrap {
     display: flex;
     justify-content: flex-end;
     margin-top: 0.15rem;
+    gap: 0.35rem;
   }
-  .ds330-copy-btn {
-    font-size: 12px;
-    color: rgba(0, 0, 0, 0.38);
+  .ds330-copy-icon-btn {
+    font-size: 13px;
+    color: rgba(0, 0, 0, 0.40);
     background: transparent;
     border: 1px solid transparent;
-    padding: 2px 8px;
+    padding: 2px 6px;
     border-radius: 8px;
+    cursor: pointer;
+    line-height: 1.2;
+  }
+  .ds330-copy-icon-btn:hover {
+    color: rgba(0, 0, 0, 0.62);
+    border-color: rgba(0, 0, 0, 0.12);
+    background: rgba(0, 0, 0, 0.03);
+  }
+  .ds330-copy-all-btn {
+    font-size: 12px;
+    color: rgba(0, 0, 0, 0.36);
+    background: transparent;
+    border: 1px solid rgba(0, 0, 0, 0.10);
+    padding: 3px 10px;
+    border-radius: 10px;
     cursor: pointer;
     line-height: 1.4;
   }
-  .ds330-copy-btn:hover {
+  .ds330-copy-all-btn:hover {
     color: rgba(0, 0, 0, 0.58);
-    border-color: rgba(0, 0, 0, 0.10);
+    border-color: rgba(0, 0, 0, 0.18);
     background: rgba(0, 0, 0, 0.03);
   }
 
@@ -152,27 +168,37 @@ st.markdown(
 # ---------------- Clipboard button (per-message + whole convo) ----------------
 
 
-def _copy_button(text: str, key: str, label: str, tooltip: str = "Copy") -> None:
-    """Render a subtle copy-to-clipboard button (no downloads)."""
+def _copy_button(
+    text: str,
+    key: str,
+    label: str,
+    css_class: str,
+    tooltip: str = "Copy",
+) -> None:
+    """Render a copy-to-clipboard button (no downloads)."""
     try:
         import streamlit.components.v1 as components
+
         payload = json.dumps(text)
-        safe_label = json.dumps(label)
+        safe_tooltip = json.dumps(tooltip)
+
+        # If it's the icon button, use a ✓ confirmation; otherwise "copied".
+        confirm = "✓" if "copy-icon" in css_class else "copied"
 
         html = f"""
         <div class="ds330-copy-wrap">
-          <button class="ds330-copy-btn" id="{key}" title="{tooltip}" aria-label="{tooltip}">{label}</button>
+          <button class="{css_class}" id="{key}" title={safe_tooltip} aria-label={safe_tooltip}>{label}</button>
         </div>
         <script>
           (() => {{
             const btn = document.getElementById("{key}");
             if (!btn) return;
+            const original = btn.textContent;
             btn.addEventListener("click", async () => {{
               try {{
                 await navigator.clipboard.writeText({payload});
-                const old = btn.textContent;
-                btn.textContent = "copied";
-                setTimeout(() => {{ btn.textContent = old; }}, 900);
+                btn.textContent = "{confirm}";
+                setTimeout(() => {{ btn.textContent = original; }}, 900);
               }} catch (e) {{
                 console.error(e);
               }}
@@ -180,7 +206,7 @@ def _copy_button(text: str, key: str, label: str, tooltip: str = "Copy") -> None
           }})();
         </script>
         """
-        components.html(html, height=30)
+        components.html(html, height=32)
     except Exception:
         # Never fall back to downloads.
         return
@@ -590,8 +616,9 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
             _copy_button(
                 m.get("content") or "",
                 key=f"copy_msg_{m.get('id','x')}",
-                label="copy",
-                tooltip="Copy this message",
+                label="⧉",
+                css_class="ds330-copy-icon-btn",
+                tooltip="Copy message",
             )
 
             # Copy whole conversation (bottom of last assistant response)
@@ -599,8 +626,9 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
                 _copy_button(
                     _conversation_to_text(msgs),
                     key=f"copy_conv_{st.session_state.get('conversation_id','new')}",
-                    label="copy all",
-                    tooltip="Copy the full conversation (text only)",
+                    label="copy whole conversation",
+                    css_class="ds330-copy-all-btn",
+                    tooltip="Copy whole conversation (text only)",
                 )
 
             # Conversation edit controls — ADMIN ONLY
@@ -744,7 +772,13 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
         st.markdown(user_text)
         _render_attachments(attachments)
         # per message copy
-        _copy_button(user_text, key=f"copy_msg_{user_msg_id}", label="copy", tooltip="Copy this message")
+        _copy_button(
+            user_text,
+            key=f"copy_msg_{user_msg_id}",
+            label="⧉",
+            css_class="ds330-copy-icon-btn",
+            tooltip="Copy message",
+        )
 
     # Build payload and stream assistant
     payload = _build_payload_messages(int(conv_id))
@@ -917,9 +951,25 @@ def _admin_dashboard(active_model: str) -> None:
 
         st.caption(f"Model: **{conv.get('model')}** · Assignment: **{conv.get('assignment_name') or '—'}**")
 
-        transcript = _conversation_to_text([{**m, "attachments": []} for m in msgs])
-        st.text_area("Transcript (text only)", value=transcript, height=320)
-        _copy_button(transcript, key=f"copy_admin_conv_{picked}", label="copy all", tooltip="Copy transcript")
+        # Render the conversation as-is (including images), and offer a transcript download.
+        mids = [int(m["id"]) for m in msgs]
+        att_map = list_attachments_for_message_ids(mids)
+
+        transcript = _conversation_to_text([{"role": m["role"], "content": m.get("content") or ""} for m in msgs])
+
+        st.download_button(
+            "download transcript",
+            data=transcript,
+            file_name=f"conversation_{picked}.txt",
+            mime="text/plain",
+            help="Downloads a text-only transcript (images excluded).",
+        )
+
+        st.divider()
+        for m in msgs:
+            with st.chat_message(m["role"]):
+                _render_message(m["role"], m.get("content") or "")
+                _render_attachments(att_map.get(int(m["id"]), []) or [])
 
 
 # ---------------- Main routing
