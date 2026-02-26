@@ -349,6 +349,7 @@ def init_db() -> None:
 
     # Ensure at least one assignment + active assignment selection
     _ensure_default_assignment()
+    _backfill_conversations_to_default_assignment()
 
 
 def _ensure_default_assignment() -> None:
@@ -385,6 +386,82 @@ def _ensure_default_assignment() -> None:
         new_id = int(row["id"])  # type: ignore
 
     set_setting("active_assignment_id", str(new_id))
+
+
+
+def _get_assignment_by_name(name: str) -> Optional[Dict[str, Any]]:
+    row = _exec(
+        "SELECT id, name, prompt FROM assignments WHERE name = ?" if not _USE_PG else "SELECT id, name, prompt FROM assignments WHERE name = %s",
+        (name,),
+        fetch="one",
+    )
+    if not row:
+        return None
+    return row if isinstance(row, dict) else {"id": row[0], "name": row[1], "prompt": row[2]}
+
+
+def _ensure_assignment_named(name: str) -> Dict[str, Any]:
+    a = _get_assignment_by_name(name)
+    if a:
+        return a
+
+    # Try to create it (race-safe: ignore if another process created it)
+    try:
+        _ = add_assignment(name, "")
+    except Exception:
+        pass
+
+    a = _get_assignment_by_name(name)
+    if a:
+        return a
+
+    # Absolute fallback: first assignment (or create again)
+    rows = list_assignments()
+    if rows:
+        return rows[0]
+    new_id = add_assignment(name, "")
+    return get_assignment(int(new_id)) or {"id": int(new_id), "name": name, "prompt": ""}
+
+
+def _backfill_conversations_to_default_assignment() -> None:
+    """Backfill older conversations to Assignment 1 and enforce title suffix.
+
+    Idempotent and safe to run on every app start.
+    """
+    a1 = _ensure_assignment_named("Assignment 1")
+    aid = int(a1["id"])
+    aname = str(a1["name"])
+    aprompt = str(a1.get("prompt") or "")
+
+    # 1) Ensure every conversation has an assignment snapshot
+    _exec(
+        (
+            "UPDATE conversations SET assignment_id = ?, assignment_name = ?, assignment_prompt = ? "
+            "WHERE assignment_id IS NULL OR assignment_name IS NULL"
+        )
+        if not _USE_PG
+        else (
+            "UPDATE conversations SET assignment_id = %s, assignment_name = %s, assignment_prompt = %s "
+            "WHERE assignment_id IS NULL OR assignment_name IS NULL"
+        ),
+        (aid, aname, aprompt),
+    )
+
+    # 2) Ensure every conversation title ends with the assignment name
+    rows = _exec(
+        "SELECT id, title, assignment_name FROM conversations" if not _USE_PG else "SELECT id, title, assignment_name FROM conversations",
+        fetch="all",
+    )
+    for r in _rows_to_dicts(rows):
+        cid = int(r.get("id"))
+        title = r.get("title") or "New conversation"
+        a = (r.get("assignment_name") or aname).strip()
+        new_title = _ensure_title_has_assignment(title, a)
+        if new_title != title:
+            _exec(
+                "UPDATE conversations SET title = ? WHERE id = ?" if not _USE_PG else "UPDATE conversations SET title = %s WHERE id = %s",
+                (new_title, cid),
+            )
 
 
 # ---------------- Settings ----------------
@@ -681,6 +758,29 @@ import re
 
 _SUFFIX_RE = re.compile(r"^(.*?)(?:\s+(\d+))$")
 
+def _ensure_title_has_assignment(title: str, assignment_name: Optional[str]) -> str:
+    """Ensure the conversation title ends with the assignment name.
+
+    Format: "<title> (<assignment_name>)"
+    """
+    t = (title or "").strip() or "New conversation"
+    a = (assignment_name or "").strip()
+    if not a:
+        return t
+
+    # If it already ends with the assignment name (common cases), don't duplicate.
+    if t.rstrip().endswith(a):
+        return t
+
+    # If it already ends with "(Assignment ...)" (more explicit), don't duplicate.
+    if re.search(r"\(\s*" + re.escape(a) + r"\s*\)\s*$", t):
+        return t
+
+    return f"{t} ({a})"
+
+
+
+
 
 def _conversation_title_exists(user_id: str, title: str) -> bool:
     title = (title or "").strip()
@@ -745,6 +845,7 @@ def create_conversation(
     assignment_prompt: Optional[str] = None,
 ) -> int:
     now = _now_iso()
+    title = _ensure_title_has_assignment(title, assignment_name)
     
     if _USE_PG:
         row = _exec(
@@ -813,6 +914,17 @@ def touch_conversation(
     params: List[Any] = [now]
 
     if title is not None:
+        # Enforce "(Assignment X)" suffix to keep titles consistent.
+        row = _exec(
+            "SELECT assignment_name FROM conversations WHERE id = ?" if not _USE_PG else "SELECT assignment_name FROM conversations WHERE id = %s",
+            (conversation_id,),
+            fetch="one",
+        )
+        an = None
+        if row:
+            an = row["assignment_name"] if isinstance(row, dict) else row[0]
+        title = _ensure_title_has_assignment(title, an)
+
         sets.append("title = ?" if not _USE_PG else "title = %s")
         params.append(title)
     if model is not None:
@@ -895,6 +1007,7 @@ def list_conversations_admin(
     user_filter: Optional[str] = None,
     role_filter: Optional[str] = None,
     model_filter: Optional[str] = None,
+    assignment_id_filter: Optional[int] = None,
     limit: int = 300,
 ) -> List[Dict[str, Any]]:
     where = []
@@ -909,13 +1022,16 @@ def list_conversations_admin(
     if model_filter:
         where.append("model = ?" if not _USE_PG else "model = %s")
         params.append(model_filter)
+    if assignment_id_filter is not None:
+        where.append("assignment_id = ?" if not _USE_PG else "assignment_id = %s")
+        params.append(int(assignment_id_filter))
 
     wsql = ("WHERE " + " AND ".join(where)) if where else ""
 
     sql = (
-        f"SELECT id, user_id, role, title, model, updated_at FROM conversations {wsql} ORDER BY updated_at DESC LIMIT ?"
+        f"SELECT id, user_id, role, title, model, assignment_id, assignment_name, updated_at FROM conversations {wsql} ORDER BY updated_at DESC LIMIT ?"
         if not _USE_PG
-        else f"SELECT id, user_id, role, title, model, updated_at FROM conversations {wsql} ORDER BY updated_at DESC LIMIT %s"
+        else f"SELECT id, user_id, role, title, model, assignment_id, assignment_name, updated_at FROM conversations {wsql} ORDER BY updated_at DESC LIMIT %s"
     )
 
     params.append(limit)

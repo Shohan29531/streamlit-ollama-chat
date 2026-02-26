@@ -574,9 +574,6 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
         labels = {None: "➕ New conversation"}
         for c in convs:
             title = c.get("title") or f"Conversation {c['id']}"
-            # Optional: include assignment tag in list (helps admins)
-            if c.get("assignment_name"):
-                title = f"{title} · {c['assignment_name']}"
             labels[c["id"]] = title
 
         current = st.session_state.get("conversation_id")
@@ -956,18 +953,33 @@ def _admin_dashboard(active_model: str) -> None:
     with tab_convs:
         st.subheader("Conversation browser")
 
-        c1, c2, c3 = st.columns([0.42, 0.30, 0.28])
+        c1, c2, c3, c4 = st.columns([0.34, 0.24, 0.20, 0.22])
         with c1:
             user_filter = st.text_input("Filter by user_id (contains)", "")
         with c2:
             model_filter = st.text_input("Filter by model (exact)", "")
         with c3:
             role_filter = st.selectbox("Filter by role", ["", "student", "admin"], index=0)
+        with c4:
+            assignments = list_assignments()
+            if assignments:
+                id_to_name = {int(a["id"]): a["name"] for a in assignments}
+                opts = [None] + list(id_to_name.keys())
+                assignment_filter = st.selectbox(
+                    "Filter by assignment",
+                    opts,
+                    index=0,
+                    format_func=lambda i: "All assignments" if i is None else id_to_name.get(int(i), str(i)),
+                )
+            else:
+                assignment_filter = None
+                st.selectbox("Filter by assignment", ["All assignments"], index=0, disabled=True)
 
         convs = list_conversations_admin(
             user_filter=user_filter or None,
             role_filter=role_filter or None,
             model_filter=model_filter or None,
+            assignment_id_filter=(int(assignment_filter) if assignment_filter is not None else None),
             limit=200,
         )
 
