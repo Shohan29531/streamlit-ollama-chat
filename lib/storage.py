@@ -437,12 +437,12 @@ def _backfill_conversations_to_default_assignment() -> None:
     _exec(
         (
             "UPDATE conversations SET assignment_id = ?, assignment_name = ?, assignment_prompt = ? "
-            "WHERE assignment_id IS NULL OR assignment_name IS NULL"
+            "WHERE assignment_id IS NULL OR assignment_name IS NULL OR assignment_name = ''"
         )
         if not _USE_PG
         else (
             "UPDATE conversations SET assignment_id = %s, assignment_name = %s, assignment_prompt = %s "
-            "WHERE assignment_id IS NULL OR assignment_name IS NULL"
+            "WHERE assignment_id IS NULL OR assignment_name IS NULL OR assignment_name = ''"
         ),
         (aid, aname, aprompt),
     )

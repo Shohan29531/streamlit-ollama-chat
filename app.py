@@ -506,7 +506,7 @@ def _sidebar(models: List[str]) -> Tuple[str, str, Dict[str, Any]]:
 
     st.sidebar.divider()
     if is_admin:
-        page = st.sidebar.radio("", ["Chat", "Admin Dashboard"], index=0, key="nav_page")
+        page = st.sidebar.radio("Navigation", ["Chat", "Admin Dashboard"], index=0, key="nav_page", label_visibility="collapsed")
         st.sidebar.divider()
     else:
         page = "Chat"
@@ -514,9 +514,14 @@ def _sidebar(models: List[str]) -> Tuple[str, str, Dict[str, Any]]:
     # Push logout to the bottom of the sidebar (no query params / no new tab)
     st.sidebar.markdown('<div class="ds330-sidebar-spacer"></div>', unsafe_allow_html=True)
     st.sidebar.markdown('<div class="ds330-sidebar-logout-wrap">', unsafe_allow_html=True)
-    if st.sidebar.button("Logout", key="logout_btn", use_container_width=True):
+    try:
+        logout_clicked = st.sidebar.button("Logout", key="logout_btn", width="stretch")
+    except TypeError:
+        logout_clicked = st.sidebar.button("Logout", key="logout_btn", use_container_width=True)
+    if logout_clicked:
         _logout()
         st.rerun()
+
     st.sidebar.markdown('</div>', unsafe_allow_html=True)
 
     return page, active_model, active_assignment
@@ -535,7 +540,10 @@ def _render_attachments(attachments: List[Dict[str, Any]]) -> None:
     if images:
         st.caption("Attachments")
         for img in images:
-            st.image(img["data"], caption=img.get("filename"), use_container_width=True)
+            try:
+                st.image(img["data"], caption=img.get("filename"), width="stretch")
+            except TypeError:
+                st.image(img["data"], caption=img.get("filename"), use_container_width=True)
 
     if files:
         st.caption("Attachments")
@@ -578,7 +586,7 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
 
         current = st.session_state.get("conversation_id")
         idx = options.index(current) if current in options else 0
-        picked = st.selectbox("", options, index=idx, format_func=lambda x: labels.get(x, str(x)))
+        picked = st.selectbox("Conversation", options, index=idx, format_func=lambda x: labels.get(x, str(x)), label_visibility="collapsed")
         if picked != current:
             if picked is None:
                 st.session_state.pop("conversation_id", None)
@@ -597,7 +605,7 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
             tcols = st.columns([0.78, 0.22])
             with tcols[0]:
                 new_title = st.text_input(
-                    "",
+                    "Thread title",
                     value=meta.get("title") or "",
                     key="thread_title_sidebar",
                     label_visibility="collapsed",
@@ -935,7 +943,10 @@ def _admin_dashboard(active_model: str) -> None:
     with tab_users:
         st.subheader("Users")
         users = list_users()
-        st.dataframe(users, use_container_width=True, hide_index=True)
+        try:
+            st.dataframe(users, width="stretch", hide_index=True)
+        except TypeError:
+            st.dataframe(users, use_container_width=True, hide_index=True)
 
         with st.expander("Add / Update user", expanded=False):
             uid = st.text_input("User ID", key="new_uid")
@@ -975,13 +986,49 @@ def _admin_dashboard(active_model: str) -> None:
                 assignment_filter = None
                 st.selectbox("Filter by assignment", ["All assignments"], index=0, disabled=True)
 
-        convs = list_conversations_admin(
-            user_filter=user_filter or None,
-            role_filter=role_filter or None,
-            model_filter=model_filter or None,
-            assignment_id_filter=(int(assignment_filter) if assignment_filter is not None else None),
-            limit=200,
-        )
+        
+        assignment_id = (int(assignment_filter) if assignment_filter is not None else None)
+
+        try:
+            convs = list_conversations_admin(
+                user_filter=user_filter or None,
+                role_filter=role_filter or None,
+                model_filter=model_filter or None,
+                assignment_id_filter=assignment_id,
+                limit=200,
+            )
+        except TypeError:
+            # Back-compat: older storage.py may not support assignment_id_filter.
+            convs = list_conversations_admin(
+                user_filter=user_filter or None,
+                role_filter=role_filter or None,
+                model_filter=model_filter or None,
+                limit=200,
+            )
+            if assignment_id is not None and assignments:
+                wanted_name = id_to_name.get(int(assignment_id))
+
+                def _matches_assignment(c: Dict[str, Any]) -> bool:
+                    # Prefer explicit fields if present
+                    try:
+                        if c.get("assignment_id") is not None and int(c.get("assignment_id")) == int(assignment_id):
+                            return True
+                    except Exception:
+                        pass
+                    if wanted_name and (c.get("assignment_name") == wanted_name):
+                        return True
+
+                    # Fallback: parse title suffix "(Assignment X)"
+                    t = (c.get("title") or "").strip()
+                    m = re.search(r"\(([^()]+)\)\s*$", t)
+                    if wanted_name and m and m.group(1).strip() == wanted_name:
+                        return True
+
+                    # Final fallback: treat missing assignment as Assignment 1
+                    return bool(wanted_name == "Assignment 1")
+
+                convs = [c for c in convs if _matches_assignment(c)]
+
 
         if not convs:
             st.caption("No conversations match filters.")
