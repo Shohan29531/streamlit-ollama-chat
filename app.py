@@ -564,7 +564,7 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
     title = f"{active_model}"
     if DEFAULT_THINK:
         title += " — Thinking"
-    st.markdown(f"# {title}")
+    st.markdown("DS 330 Chat")
 
     # Sidebar thread picker
     with st.sidebar:
@@ -611,9 +611,9 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
                     st.rerun()
 
     # Chat title (ChatGPT-style): show model, and show Thinking if enabled
-    if active_model:
-        _title = active_model + (" — Thinking" if DEFAULT_THINK else "")
-        st.markdown(f"# {_title}")
+    # if active_model:
+    #     _title = active_model + (" — Thinking" if DEFAULT_THINK else "")
+    #     st.markdown(f"# {_title}")
 
     # Render chat history
     msgs = st.session_state.get("messages", [])
