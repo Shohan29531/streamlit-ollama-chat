@@ -966,7 +966,28 @@ def _admin_dashboard(active_model: str) -> None:
 
         c1, c2, c3, c4 = st.columns([0.34, 0.24, 0.20, 0.22])
         with c1:
-            user_filter = st.text_input("Filter by user_id (contains)", "")
+            users = list_users()
+            if users:
+                user_ids = [u.get("user_id") for u in users if u.get("user_id")]
+                user_opts = [None] + sorted(set([str(u) for u in user_ids]))
+                picked_user = st.selectbox(
+                    "Filter by user_id",
+                    user_opts,
+                    index=0,
+                    format_func=lambda u: "All users" if u is None else str(u),
+                    key="admin_user_filter_select",
+                )
+                # list_conversations_admin uses a contains filter; passing the full ID yields an exact match.
+                user_filter = "" if picked_user is None else str(picked_user)
+            else:
+                st.selectbox(
+                    "Filter by user_id",
+                    ["All users"],
+                    index=0,
+                    disabled=True,
+                    key="admin_user_filter_select_empty",
+                )
+                user_filter = ""
         with c2:
             model_filter = st.text_input("Filter by model (exact)", "")
         with c3:
