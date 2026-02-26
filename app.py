@@ -125,16 +125,16 @@ st.markdown(
     border-color: rgba(0, 0, 0, 0.12);
     background: rgba(0, 0, 0, 0.03);
   }
-.ds330-copy-all-btn {
+  .ds330-copy-all-btn {
     font-size: 12px;
-    color: rgba(0, 0, 0, 0.48);          /* grey text */
+    color: rgba(0, 0, 0, 0.36);
     background: transparent;
-    border: 1px solid rgba(0, 0, 0, 0.06); /* very light grey border */
+    border: 1px solid rgba(0, 0, 0, 0.10);
     padding: 3px 10px;
     border-radius: 10px;
     cursor: pointer;
     line-height: 1.4;
-    }
+  }
   .ds330-copy-all-btn:hover {
     color: rgba(0, 0, 0, 0.58);
     border-color: rgba(0, 0, 0, 0.18);
@@ -564,7 +564,7 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
     title = f"{active_model}"
     if DEFAULT_THINK:
         title += " — Thinking"
-    st.markdown("## DS330 Chat Assistant")
+    st.markdown(f"# {title}")
 
     # Sidebar thread picker
     with st.sidebar:
@@ -574,9 +574,8 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
         labels = {None: "➕ New conversation"}
         for c in convs:
             title = c.get("title") or f"Conversation {c['id']}"
-            # Optional: include assignment tag in list (helps admins)
-            if c.get("assignment_name"):
-                title = f"{title} · {c['assignment_name']}"
+            # Always include assignment tag (all conversations belong to an assignment)
+            title = f"{title} · {c.get('assignment_name') or 'Assignment 1'}"
             labels[c["id"]] = title
 
         current = st.session_state.get("conversation_id")
@@ -611,10 +610,10 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
                     st.session_state["conversation_meta"] = get_conversation(int(conv_id)) or {}
                     st.rerun()
 
-    # # Chat title (ChatGPT-style): show model, and show Thinking if enabled
-    # if active_model:
-    #     _title = active_model + (" — Thinking" if DEFAULT_THINK else "")
-    #     st.markdown(f"# {_title}")
+    # Chat title (ChatGPT-style): show model, and show Thinking if enabled
+    if active_model:
+        _title = active_model + (" — Thinking" if DEFAULT_THINK else "")
+        st.markdown(f"# {_title}")
 
     # Render chat history
     msgs = st.session_state.get("messages", [])
@@ -639,7 +638,7 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
                 _copy_button(
                     _conversation_to_text(msgs),
                     key=f"copy_conv_{st.session_state.get('conversation_id','new')}",
-                    label="Copy Whole Conversation",
+                    label="copy whole conversation",
                     css_class="ds330-copy-all-btn",
                     tooltip="Copy whole conversation (text only)",
                 )
@@ -956,7 +955,8 @@ def _admin_dashboard(active_model: str) -> None:
     with tab_convs:
         st.subheader("Conversation browser")
 
-        c1, c2, c3 = st.columns([0.42, 0.30, 0.28])
+        # Filters
+        c1, c2, c3, c4 = st.columns([0.34, 0.22, 0.18, 0.26])
         with c1:
             user_filter = st.text_input("Filter by user_id (contains)", "")
         with c2:
@@ -964,10 +964,22 @@ def _admin_dashboard(active_model: str) -> None:
         with c3:
             role_filter = st.selectbox("Filter by role", ["", "student", "admin"], index=0)
 
+        with c4:
+            assignments = list_assignments()
+            a_name_by_id = {int(a["id"]): a["name"] for a in assignments}
+            a_opts = [None] + list(a_name_by_id.keys())
+            a_pick = st.selectbox(
+                "Filter by assignment",
+                a_opts,
+                index=0,
+                format_func=lambda i: "(all)" if i is None else a_name_by_id.get(int(i), str(i)),
+            )
+
         convs = list_conversations_admin(
             user_filter=user_filter or None,
             role_filter=role_filter or None,
             model_filter=model_filter or None,
+            assignment_id_filter=(int(a_pick) if a_pick is not None else None),
             limit=200,
         )
 
@@ -980,7 +992,8 @@ def _admin_dashboard(active_model: str) -> None:
         for c in convs:
             cid = c["id"]
             title = c.get("title") or f"Conversation {cid}"
-            labels[cid] = f"{c.get('updated_at','')} · {c.get('user_id','')} · {title}"
+            aname = c.get("assignment_name") or "Assignment 1"
+            labels[cid] = f"{c.get('updated_at','')} · {c.get('user_id','')} · {title} · {aname}"
 
         picked = st.selectbox("Select conversation", conv_ids, format_func=lambda x: labels.get(x, str(x)))
         conv = get_conversation(int(picked)) or {}

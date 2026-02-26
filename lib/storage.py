@@ -5,17 +5,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
-import hmac
-from passlib.context import CryptContext
-
-# Password hashing context:
-# - default: bcrypt_sha256 (handles >72-byte passwords safely)
-# - supports legacy bcrypt ($2...) and pbkdf2_sha256
-PWD_CONTEXT = CryptContext(
-    schemes=["bcrypt_sha256", "bcrypt", "pbkdf2_sha256"],
-    deprecated=["bcrypt", "pbkdf2_sha256"],
-)
-
+from passlib.hash import bcrypt
 
 # Optional: psycopg (Postgres) for Supabase Postgres
 try:
@@ -350,6 +340,63 @@ def init_db() -> None:
     # Ensure at least one assignment + active assignment selection
     _ensure_default_assignment()
 
+    # Backfill: older conversations may have no assignment.* columns populated.
+    # Starting now we assume every conversation belongs to an assignment.
+    _backfill_conversation_assignments()
+
+
+def _backfill_conversation_assignments() -> None:
+    """Assign all existing conversations to Assignment 1 if missing."""
+
+    # Ensure Assignment 1 exists (created by _ensure_default_assignment()).
+    row = _exec(
+        "SELECT id, name, prompt FROM assignments WHERE name = ?" if not _USE_PG else
+        "SELECT id, name, prompt FROM assignments WHERE name = %s",
+        ("Assignment 1",),
+        fetch="one",
+    )
+
+    if not row:
+        # Fallback: take the first assignment.
+        row = _exec(
+            "SELECT id, name, prompt FROM assignments ORDER BY id LIMIT 1",
+            fetch="one",
+        )
+        if not row:
+            return
+
+    a_id = int(row["id"] if isinstance(row, dict) else row[0])
+    a_name = (row["name"] if isinstance(row, dict) else row[1]) or "Assignment 1"
+    a_prompt = (row["prompt"] if isinstance(row, dict) else row[2]) or ""
+
+    # Only fill when missing; do NOT overwrite system_prompt snapshots.
+    if _USE_PG:
+        _exec(
+            """
+            UPDATE conversations
+            SET assignment_id = COALESCE(assignment_id, %s),
+                assignment_name = COALESCE(NULLIF(assignment_name, ''), %s),
+                assignment_prompt = COALESCE(NULLIF(assignment_prompt, ''), %s)
+            WHERE assignment_id IS NULL
+               OR assignment_name IS NULL OR assignment_name = ''
+               OR assignment_prompt IS NULL OR assignment_prompt = ''
+            """,
+            (a_id, a_name, a_prompt),
+        )
+    else:
+        _exec(
+            """
+            UPDATE conversations
+            SET assignment_id = COALESCE(assignment_id, ?),
+                assignment_name = COALESCE(NULLIF(assignment_name, ''), ?),
+                assignment_prompt = COALESCE(NULLIF(assignment_prompt, ''), ?)
+            WHERE assignment_id IS NULL
+               OR assignment_name IS NULL OR assignment_name = ''
+               OR assignment_prompt IS NULL OR assignment_prompt = ''
+            """,
+            (a_id, a_name, a_prompt),
+        )
+
 
 def _ensure_default_assignment() -> None:
     rows = list_assignments()
@@ -438,8 +485,7 @@ def any_admin_exists() -> bool:
 
 
 def upsert_user(user_id: str, password: str, role: str) -> None:
-    # New hashes use bcrypt_sha256 to avoid bcrypt's 72-byte password limit.
-    pw_hash = PWD_CONTEXT.hash(password)
+    pw_hash = bcrypt.hash(password)
     if _USE_PG:
         _exec(
             """
@@ -462,84 +508,20 @@ def upsert_user(user_id: str, password: str, role: str) -> None:
         )
 
 
-def _bcrypt_truncate_secret(secret: str) -> bytes:
-    """Return <=72-byte secret for legacy bcrypt hashes.
-
-    bcrypt only considers the first 72 bytes; newer bcrypt releases may raise ValueError for longer input.
-    We truncate *bytes* (UTF-8) to mirror bcrypt's behavior.
-    """
-    b = (secret or "").encode("utf-8")
-    return b if len(b) <= 72 else b[:72]
-
-
 def verify_user(user_id: str, password: str) -> Optional[Dict[str, str]]:
-    """Verify user credentials.
-
-    Supports:
-      - bcrypt_sha256 (preferred; safe for long passwords)
-      - legacy bcrypt ($2a$/$2b$/$2y$...)
-      - legacy pbkdf2_sha256
-      - legacy plaintext (auto-upgraded on successful login)
-    """
     row = _exec(
-        "SELECT user_id, password_hash, role FROM users WHERE user_id = ?"
-        if not _USE_PG
-        else "SELECT user_id, password_hash, role FROM users WHERE user_id = %s",
+        "SELECT user_id, password_hash, role FROM users WHERE user_id = ?" if not _USE_PG else "SELECT user_id, password_hash, role FROM users WHERE user_id = %s",
         (user_id,),
         fetch="one",
     )
     if not row:
         return None
-
     d = row if isinstance(row, dict) else {"user_id": row[0], "password_hash": row[1], "role": row[2]}
-    stored = d.get("password_hash")
-    if stored is None:
-        return None
+    if bcrypt.verify(password, d["password_hash"]):
+        return {"user_id": d["user_id"], "role": d["role"]}
+    return None
 
-    # Normalize (bytes -> str, strip whitespace, strip b'..' wrapper)
-    if isinstance(stored, (bytes, bytearray)):
-        stored = stored.decode("utf-8", errors="ignore")
-    stored = str(stored).strip()
-    if (stored.startswith("b'") and stored.endswith("'")) or (stored.startswith('b"') and stored.endswith('"')):
-        stored = stored[2:-1]
 
-    ok = False
-    used_plaintext = False
-
-    if stored.startswith("$"):
-        # Hashed formats handled by passlib.
-        try:
-            ok = PWD_CONTEXT.verify(password, stored)
-        except ValueError as e:
-            # Newer bcrypt releases can raise for long secrets; retry truncated for legacy $2... hashes.
-            if "72" in str(e) and stored.startswith("$2"):
-                try:
-                    ok = PWD_CONTEXT.verify(_bcrypt_truncate_secret(password), stored)
-                except Exception:
-                    ok = False
-            else:
-                ok = False
-        except Exception:
-            ok = False
-    else:
-        # Legacy plaintext (not recommended)
-        used_plaintext = True
-        ok = hmac.compare_digest(password, stored)
-
-    if not ok:
-        return None
-
-    # Upgrade legacy hashes (and plaintext) to the preferred scheme.
-    if used_plaintext or (stored.startswith("$") and PWD_CONTEXT.needs_update(stored)):
-        new_hash = PWD_CONTEXT.hash(password)
-        _exec(
-            "UPDATE users SET password_hash = ? WHERE user_id = ?"
-            if not _USE_PG
-            else "UPDATE users SET password_hash = %s WHERE user_id = %s",
-            (new_hash, user_id),
-        )
-
-    return {"user_id": d["user_id"], "role": d["role"]}
 def list_users() -> List[Dict[str, Any]]:
     rows = _exec("SELECT user_id, role FROM users ORDER BY user_id", fetch="all")
     return _rows_to_dicts(rows)
@@ -677,61 +659,7 @@ def set_base_system_prompt(prompt: str) -> None:
 
 
 # ---------------- Conversations ----------------
-import re
 
-_SUFFIX_RE = re.compile(r"^(.*?)(?:\s+(\d+))$")
-
-
-def _conversation_title_exists(user_id: str, title: str) -> bool:
-    title = (title or "").strip()
-    if not title:
-        return False
-
-    if _USE_PG:
-        row = _exec(
-            "SELECT 1 FROM conversations WHERE user_id = %s AND title = %s LIMIT 1",
-            (user_id, title),
-            fetch="one",
-        )
-    else:
-        row = _exec(
-            "SELECT 1 FROM conversations WHERE user_id = ? AND title = ? LIMIT 1",
-            (user_id, title),
-            fetch="one",
-        )
-    return bool(row)
-
-
-def _dedupe_conversation_title(user_id: str, requested_title: str) -> str:
-    title = (requested_title or "").strip() or "New conversation"
-
-    # If it's not taken, keep it.
-    if not _conversation_title_exists(user_id, title):
-        return title
-
-    # If user already asked for something like "New conversation 2"
-    # and "New conversation" exists, then continue from 3, 4, ...
-    base = title
-    n = 2
-    m = _SUFFIX_RE.match(title)
-    if m:
-        base0 = m.group(1).strip()
-        try:
-            n0 = int(m.group(2)) + 1
-        except Exception:
-            n0 = 2
-
-        # Only treat it as a suffix if the base title exists.
-        # (So titles like "HW 2" won't become "HW 3" unless "HW" exists.)
-        if base0 and _conversation_title_exists(user_id, base0):
-            base = base0
-            n = n0
-
-    while True:
-        cand = f"{base} {n}"
-        if not _conversation_title_exists(user_id, cand):
-            return cand
-        n += 1
 
 def create_conversation(
     user_id: str,
@@ -744,10 +672,18 @@ def create_conversation(
     assignment_name: Optional[str] = None,
     assignment_prompt: Optional[str] = None,
 ) -> int:
+    # Backstop: ensure assignment metadata is always present.
+    if assignment_id is None or assignment_name is None:
+        try:
+            a = get_active_assignment()
+            assignment_id = assignment_id if assignment_id is not None else int(a["id"])
+            assignment_name = assignment_name if assignment_name is not None else a.get("name")
+            if assignment_prompt is None:
+                assignment_prompt = a.get("prompt") or ""
+        except Exception:
+            assignment_id = assignment_id if assignment_id is not None else None
+
     now = _now_iso()
-
-    title = _dedupe_conversation_title(user_id, title)
-
     if _USE_PG:
         row = _exec(
             """
@@ -897,6 +833,7 @@ def list_conversations_admin(
     user_filter: Optional[str] = None,
     role_filter: Optional[str] = None,
     model_filter: Optional[str] = None,
+    assignment_id_filter: Optional[int] = None,
     limit: int = 300,
 ) -> List[Dict[str, Any]]:
     where = []
@@ -912,12 +849,16 @@ def list_conversations_admin(
         where.append("model = ?" if not _USE_PG else "model = %s")
         params.append(model_filter)
 
+    if assignment_id_filter is not None:
+        where.append("assignment_id = ?" if not _USE_PG else "assignment_id = %s")
+        params.append(int(assignment_id_filter))
+
     wsql = ("WHERE " + " AND ".join(where)) if where else ""
 
     sql = (
-        f"SELECT id, user_id, role, title, model, updated_at FROM conversations {wsql} ORDER BY updated_at DESC LIMIT ?"
+        f"SELECT id, user_id, role, title, model, assignment_id, assignment_name, updated_at FROM conversations {wsql} ORDER BY updated_at DESC LIMIT ?"
         if not _USE_PG
-        else f"SELECT id, user_id, role, title, model, updated_at FROM conversations {wsql} ORDER BY updated_at DESC LIMIT %s"
+        else f"SELECT id, user_id, role, title, model, assignment_id, assignment_name, updated_at FROM conversations {wsql} ORDER BY updated_at DESC LIMIT %s"
     )
 
     params.append(limit)
