@@ -617,6 +617,37 @@ def verify_user(user_id: str, password: str) -> Optional[Dict[str, str]]:
         )
 
     return {"user_id": d["user_id"], "role": d["role"]}
+
+
+def set_user_password(user_id: str, new_password: str) -> bool:
+    """Set a user's password.
+
+    Returns True if the user exists and the password was updated.
+    """
+    exists = _exec(
+        "SELECT 1 FROM users WHERE user_id = ?" if not _USE_PG else "SELECT 1 FROM users WHERE user_id = %s",
+        (user_id,),
+        fetch="one",
+    )
+    if not exists:
+        return False
+
+    pw_hash = PWD_CONTEXT.hash(new_password)
+    _exec(
+        "UPDATE users SET password_hash = ? WHERE user_id = ?"
+        if not _USE_PG
+        else "UPDATE users SET password_hash = %s WHERE user_id = %s",
+        (pw_hash, user_id),
+    )
+    return True
+
+
+def change_user_password(user_id: str, current_password: str, new_password: str) -> bool:
+    """Change a user's password after verifying their current password."""
+    auth = verify_user(user_id, current_password)
+    if not auth:
+        return False
+    return set_user_password(user_id, new_password)
 def list_users() -> List[Dict[str, Any]]:
     rows = _exec("SELECT user_id, role FROM users ORDER BY user_id", fetch="all")
     return _rows_to_dicts(rows)

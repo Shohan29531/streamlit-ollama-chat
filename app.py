@@ -19,6 +19,7 @@ from lib.storage import (
     any_admin_exists,
     upsert_user,
     verify_user,
+    change_user_password,
     create_session,
     get_session,
     delete_session,
@@ -513,6 +514,30 @@ def _sidebar(models: List[str]) -> Tuple[str, str, Dict[str, Any]]:
 
     # Push logout to the bottom of the sidebar (no query params / no new tab)
     st.sidebar.markdown('<div class="ds330-sidebar-spacer"></div>', unsafe_allow_html=True)
+
+    # Self-service password change (all roles)
+    with st.sidebar.expander("Change password", expanded=False):
+        with st.form("change_password_form"):
+            current_pw = st.text_input("Current password", type="password", key="cp_current")
+            new_pw = st.text_input("New password", type="password", key="cp_new")
+            confirm_pw = st.text_input("Confirm new password", type="password", key="cp_confirm")
+            submitted = st.form_submit_button("Update password")
+
+        if submitted:
+            if not current_pw or not new_pw or not confirm_pw:
+                st.error("Please fill in all fields.")
+            elif new_pw != confirm_pw:
+                st.error("New passwords do not match.")
+            elif len(new_pw) < 6:
+                st.error("Password must be at least 6 characters.")
+            elif not change_user_password(user_id, current_pw, new_pw):
+                st.error("Current password is incorrect.")
+            else:
+                # Clear inputs so the new password isn't kept in widget state.
+                for k in ["cp_current", "cp_new", "cp_confirm"]:
+                    st.session_state[k] = ""
+                st.success("Password updated.")
+
     st.sidebar.markdown('<div class="ds330-sidebar-logout-wrap">', unsafe_allow_html=True)
     try:
         logout_clicked = st.sidebar.button("Logout", key="logout_btn", width="stretch")
