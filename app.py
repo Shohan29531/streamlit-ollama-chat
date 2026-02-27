@@ -517,7 +517,14 @@ def _sidebar(models: List[str]) -> Tuple[str, str, Dict[str, Any]]:
 
     # Self-service password change (all roles)
     with st.sidebar.expander("Change password", expanded=False):
-        with st.form("change_password_form"):
+        # Use a form so inputs clear safely after submit.
+        try:
+            form_ctx = st.form("change_password_form", clear_on_submit=True)
+        except TypeError:
+            # Older Streamlit
+            form_ctx = st.form("change_password_form")
+
+        with form_ctx:
             current_pw = st.text_input("Current password", type="password", key="cp_current")
             new_pw = st.text_input("New password", type="password", key="cp_new")
             confirm_pw = st.text_input("Confirm new password", type="password", key="cp_confirm")
@@ -533,10 +540,7 @@ def _sidebar(models: List[str]) -> Tuple[str, str, Dict[str, Any]]:
             elif not change_user_password(user_id, current_pw, new_pw):
                 st.error("Current password is incorrect.")
             else:
-                # Clear inputs so the new password isn't kept in widget state.
-                for k in ["cp_current", "cp_new", "cp_confirm"]:
-                    st.session_state[k] = ""
-                st.success("Password updated.")
+                st.success("Password successfully changed!")
 
     st.sidebar.markdown('<div class="ds330-sidebar-logout-wrap">', unsafe_allow_html=True)
     try:
