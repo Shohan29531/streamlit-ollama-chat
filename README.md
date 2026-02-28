@@ -1,16 +1,28 @@
+# TeachPilot
+
+TeachPilot: A teacher-guided LLM assistant (built using Streamlit and Ollama cloud models) that adapts per assignment and enforces instructor-set constraints to promote reasoning-first learning.
+
+> **Important (course adaptation):** This repository is currently configured/adapted for **DS 330 at Penn State IST**.
+> If you’re using TeachPilot for another course or institution, you should adapt assignment names, prompts, constraint policies, and any DS330-specific terminology/instructions to your own context.
+
+---
+
 # DS330 Chat (Streamlit) — Deployment & Admin Guide
 
 A classroom-oriented, **ChatGPT-like** Streamlit app for DS330 that supports:
 - **Ollama Cloud** model selection (dropdown populated from Ollama Cloud)
 - **Text + image + file uploads** in the chat input
 - **Assignments** (admin selects an active assignment; students see it)
+- **Assignment-scoped conversations**: every conversation is stored under an assignment and the title automatically appends the assignment name (e.g., `… (Assignment 2)`).
 - **Two-part system prompts**: Base prompt + Assignment-specific prompt
 - **Supabase Postgres** persistence (recommended) with optional **Supabase Storage** for uploads
-- Student-friendly UX (copy message / copy whole conversation) and admin tools (browse conversations, download transcript)
+- Student-friendly UX (copy message / copy whole conversation) and admin tools (browse conversations, **filter by assignment/user**, download transcript)
+- Self-service account tools: **all users can change their own password** from the sidebar
 
 > **Roles**
 > - **Admin**: manages assignments, prompts, users, and conversation browser
 > - **Student**: chats only (no conversation editing)
+> - **All users**: can change their own password (sidebar)
 
 ---
 
@@ -146,7 +158,7 @@ All configuration is read from Streamlit secrets and environment variables.
 
 ### Auth
 - `COOKIE_SECRET` (long random string)
-- `BOOTSTRAP_PASSWORD` (admin bootstrap)
+- `BOOTSTRAP_PASSWORD` (admin bootstrap; used only to create/seed the initial admin password on first run—change it immediately using the in-app **Change password** control)
 
 ### Optional
 - `MODEL_ALLOWLIST` (comma-separated model names). If set, only these models appear in the dropdown.
@@ -232,6 +244,12 @@ The Admin dashboard provides:
     - **Base system prompt** (applies to all assignments)
     - **Assignment-specific prompt** (applies only to selected assignment)
 
+
+### Conversation assignment rules
+- **All new conversations** are created under the currently active assignment.
+- Conversation titles automatically append the assignment name (e.g., `My title (Assignment 3)`).
+- **Legacy conversations** (from before assignment-scoped conversations were enforced) are automatically backfilled to **Assignment 1** on startup.
+
 ### Student UX
 Students see:
 - The active **Model**
@@ -241,8 +259,10 @@ Students see:
 
 ## Conversation Browser & Transcripts (Admin)
 
-Admin can browse:
-- Any user’s conversations
+Admin can browse and filter:
+- **Assignment** (dropdown; “All assignments” by default)
+- **User** (dropdown; “All users” by default)
+- Optional filters: role and model (if enabled in your build)
 - Full conversation view “as-is” (chat bubble format)
 - **Download transcript** button:
   - Exports a `.txt` transcript (text only; images excluded)
