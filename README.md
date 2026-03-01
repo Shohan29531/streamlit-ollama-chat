@@ -4,6 +4,7 @@ TeachPilot: A teacher-guided LLM assistant (built using Streamlit and Ollama clo
 
 > **Important (course adaptation):** This repository is currently configured/adapted for **DS 330 at Penn State IST**.
 > If you’re using TeachPilot for another course or institution, you should adapt assignment names, prompts, constraint policies, and any DS330-specific terminology/instructions to your own context.
+
 > Since all the student conversations are saved and can be viewed by the admin, you could probably need an IRB approval, depending on the classroom and privacy protection policies at your institution. Moreover, the students should know beforehand that their chats will be recorded and they should not use it for topics outside of classroom activities.
 
 ---
