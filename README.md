@@ -7,22 +7,21 @@ TeachPilot: A teacher-guided LLM assistant (built using Streamlit and Ollama clo
 
 ---
 
-# DS330 Chat (Streamlit) — Deployment & Admin Guide
+# Deployment & Admin Guide
 
-A classroom-oriented, **ChatGPT-like** Streamlit app for DS330 that supports:
+TeachPilot supports:
 - **Ollama Cloud** model selection (dropdown populated from Ollama Cloud)
-- **Text + image + file uploads** in the chat input
+- **Text + image + file uploads** in the chat input if you select the vision-language models
 - **Assignments** (admin selects an active assignment; students see it)
 - **Assignment-scoped conversations**: every conversation is stored under an assignment and the title automatically appends the assignment name (e.g., `… (Assignment 2)`).
 - **Two-part system prompts**: Base prompt + Assignment-specific prompt
 - **Supabase Postgres** persistence (recommended) with optional **Supabase Storage** for uploads
 - Student-friendly UX (copy message / copy whole conversation) and admin tools (browse conversations, **filter by assignment/user**, download transcript)
-- Self-service account tools: **all users can change their own password** from the sidebar
 
 > **Roles**
 > - **Admin**: manages assignments, prompts, users, and conversation browser
 > - **Student**: chats only (no conversation editing)
-> - **All users**: can change their own password (sidebar)
+> - **All users**: can change their own password
 
 ---
 
