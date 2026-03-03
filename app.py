@@ -497,7 +497,7 @@ def _sidebar(models: List[str]) -> Tuple[str, str, Dict[str, Any]]:
         saved_key = None
 
     with st.sidebar.container():
-        st.markdown("**Bring your own API key**")
+        st.markdown("**Bring your own API key (optional)**")
         # st.caption("(for more chat limits)")
         st.markdown("Get your key here: [Ollama API keys](https://ollama.com/settings/keys)")
 
