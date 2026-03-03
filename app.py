@@ -497,17 +497,19 @@ def _sidebar(models: List[str]) -> Tuple[str, str, Dict[str, Any]]:
         saved_key = None
 
     with st.sidebar.container():
-        hdr_cols = st.columns([0.90, 0.10])
+        hdr_cols = st.columns([0.88, 0.12], vertical_alignment="center")
+
         with hdr_cols[0]:
             st.markdown("**Bring your own API key**")
-            
+            st.caption("Optional — faster responses")
+
         with hdr_cols[1]:
-            # Prefer a popover so the UI stays compact; fall back to a simple link.
+            # Keep help compact and avoid overlap: use a small button that opens a popover
             try:
-                with st.popover("ℹ️"):
-                    st.markdown("Get your key from: [Ollama API keys](https://ollama.com/settings/keys)")
+                with st.popover("ℹ️", use_container_width=True):
+                    st.markdown("Get your key here: [Ollama API keys](https://ollama.com/settings/keys)")
             except Exception:
-                st.markdown("[ℹ️](https://ollama.com/settings/keys)")
+                st.link_button("ℹ️", "https://ollama.com/settings/keys")
 
         if saved_key:
             st.caption("✅ Using your personal API key for model calls.")
