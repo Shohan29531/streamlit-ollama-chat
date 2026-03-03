@@ -7,6 +7,8 @@ TeachPilot: A teacher-guided LLM assistant (built using Streamlit and Ollama clo
 
 > Since all the student conversations are saved and can be viewed by the admin, you could probably need an IRB approval, depending on the classroom and privacy protection policies at your institution. Moreover, the students should know beforehand that their chats will be recorded and they should not use it for topics outside of classroom activities.
 
+> Students will have the option to bring in their own API keys. In fact, this is **highly recommended** so that they do not run into usage limit.
+
 ---
 
 # Deployment & Admin Guide
