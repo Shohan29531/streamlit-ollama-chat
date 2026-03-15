@@ -276,7 +276,11 @@ def _logout() -> None:
 
 # ---------------- DB init ----------------
 
-init_db()
+@st.cache_resource
+def _ensure_db_ready():
+    init_db()
+
+_ensure_db_ready()
 
 
 # ---------------- Session restore ----------------
