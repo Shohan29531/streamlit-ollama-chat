@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import streamlit as st
 from streamlit_cookies_manager_ext import EncryptedCookieManager
 
-from lib.ollama_api import chat_stream, list_models
+from lib.ollama_api import chat_stream
 from lib.render import render_chat_text
 from lib.attachments import (
     extract_text_from_bytes,
@@ -93,6 +93,7 @@ def _effective_api_key() -> Optional[str]:
 
 
 MODEL_SETTING_KEY = "active_model"
+FIXED_MODEL = "qwen3-vl:235b-instruct"
 
 st.set_page_config(page_title=APP_NAME, page_icon="💬", layout="wide")
 
@@ -298,21 +299,11 @@ if "user_id" not in st.session_state:
 
 
 
-# ---------------- Model list (Ollama Cloud) ----------------
+# ---------------- Model configuration ----------------
 
-@st.cache_data(ttl=60, show_spinner=False)
-def _cached_models(host: str, api_key: str | None) -> List[str]:
-    return list_models(host, api_key)
+# Model is fixed for all users to avoid inconsistent states.
+# Admins cannot change this via the UI.
 
-
-def _load_active_model(models: List[str]) -> str:
-    saved = get_setting(MODEL_SETTING_KEY, None)
-    if saved and saved in models:
-        return saved
-    if models:
-        set_setting(MODEL_SETTING_KEY, models[0])
-        return models[0]
-    return ""
 
 
 # ---------------- Prompts / Assignments ----------------
@@ -484,7 +475,7 @@ def _render_login() -> None:
 # ---------------- Sidebar ----------------
 
 
-def _sidebar(models: List[str]) -> Tuple[str, str, Dict[str, Any]]:
+def _sidebar() -> Tuple[str, str, Dict[str, Any]]:
     user_id = st.session_state["user_id"]
     role = st.session_state["role"]
     is_admin = role == "admin"
@@ -539,33 +530,31 @@ def _sidebar(models: List[str]) -> Tuple[str, str, Dict[str, Any]]:
     active_assignment = get_active_assignment()
     st.sidebar.caption(f"**Active assignment:** {active_assignment.get('name')}")
 
-    # Model selection
-    active_model = _load_active_model(models)
-    if is_admin:
-        if models:
-            sel = st.sidebar.selectbox("Active model", models, index=models.index(active_model))
-            if sel != active_model:
-                set_setting(MODEL_SETTING_KEY, sel)
-                active_model = sel
-        else:
-            st.sidebar.warning("No models found. Check OLLAMA_HOST / API key.")
+    # Model (fixed)
+    active_model = FIXED_MODEL
+    try:
+        st.sidebar.selectbox("Active model", [FIXED_MODEL], index=0, disabled=True)
+    except TypeError:
+        # Older Streamlit: no 'disabled' kwarg
+        st.sidebar.selectbox("Active model", [FIXED_MODEL], index=0)
+    st.sidebar.caption("Model is fixed by the instructor for consistency.")
 
         # Assignment selection (admin only)
-        assignments = list_assignments()
-        if assignments:
-            id_to_name = {int(a["id"]): a["name"] for a in assignments}
-            ids = list(id_to_name.keys())
-            active_id = int(active_assignment["id"])
-            idx = ids.index(active_id) if active_id in ids else 0
-            new_id = st.sidebar.selectbox(
-                "Set active assignment",
-                ids,
-                format_func=lambda i: id_to_name.get(int(i), str(i)),
-                index=idx,
-            )
-            if int(new_id) != active_id:
-                set_active_assignment(int(new_id))
-                st.rerun()
+    assignments = list_assignments()
+    if assignments:
+        id_to_name = {int(a["id"]): a["name"] for a in assignments}
+        ids = list(id_to_name.keys())
+        active_id = int(active_assignment["id"])
+        idx = ids.index(active_id) if active_id in ids else 0
+        new_id = st.sidebar.selectbox(
+            "Set active assignment",
+            ids,
+            format_func=lambda i: id_to_name.get(int(i), str(i)),
+            index=idx,
+        )
+        if int(new_id) != active_id:
+            set_active_assignment(int(new_id))
+            st.rerun()
 
     else:
         st.sidebar.caption(f"**Active model:** {active_model}")
@@ -1190,9 +1179,7 @@ def main() -> None:
     if "user_id" not in st.session_state:
         _render_login()
         return
-
-    models = _cached_models(OLLAMA_HOST, _effective_api_key())
-    page, active_model, active_assignment = _sidebar(models)
+    page, active_model, active_assignment = _sidebar()
 
     if page == "Admin Dashboard" and st.session_state.get("role") == "admin":
         _admin_dashboard(active_model)
