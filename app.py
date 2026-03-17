@@ -301,11 +301,8 @@ if "user_id" not in st.session_state:
 # ---------------- Model list (Ollama Cloud) ----------------
 
 @st.cache_data(ttl=60, show_spinner=False)
-def _cached_models() -> List[str]:
-    try:
-        return list_models(OLLAMA_HOST, OLLAMA_API_KEY)
-    except Exception:
-        return []
+def _cached_models(host: str, api_key: str | None) -> List[str]:
+    return list_models(host, api_key)
 
 
 def _load_active_model(models: List[str]) -> str:
@@ -1194,7 +1191,7 @@ def main() -> None:
         _render_login()
         return
 
-    models = _cached_models()
+    models = _cached_models(OLLAMA_HOST, _effective_api_key())
     page, active_model, active_assignment = _sidebar(models)
 
     if page == "Admin Dashboard" and st.session_state.get("role") == "admin":
