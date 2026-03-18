@@ -181,8 +181,24 @@ st.markdown(
     text-align: left !important;
   }
 
-  section[data-testid="stSidebar"] div.stButton > button * {
+  section[data-testid="stSidebar"] div.stButton > button p,
+  section[data-testid="stSidebar"] div.stButton > button span {
     text-align: left !important;
+    width: 100% !important;
+  }
+
+  section[data-testid="stSidebar"] div[data-testid="stPopover"] button {
+    justify-content: center !important;
+    text-align: center !important;
+    min-width: 2.25rem !important;
+    padding-left: 0.25rem !important;
+    padding-right: 0.25rem !important;
+  }
+
+  section[data-testid="stSidebar"] div[data-testid="stPopover"] button p,
+  section[data-testid="stSidebar"] div[data-testid="stPopover"] button span {
+    text-align: center !important;
+    width: auto !important;
   }
 
   .ds330-sidebar-logout-wrap {
@@ -200,8 +216,10 @@ st.markdown(
     background: rgba(0, 0, 0, 0.02) !important;
   }
 
-  .ds330-sidebar-logout-wrap div.stButton > button * {
+  .ds330-sidebar-logout-wrap div.stButton > button p,
+  .ds330-sidebar-logout-wrap div.stButton > button span {
     text-align: center !important;
+    width: auto !important;
   }
 
   .ds330-sidebar-logout-wrap div.stButton > button:hover {
@@ -411,6 +429,23 @@ def _maybe_title_new_conversation(conversation_id: int, user_text: str) -> None:
     fresh = get_conversation(conversation_id) or {}
     st.session_state["conversation_meta"] = fresh
     st.session_state["conversation_uid"] = fresh.get("conversation_uid")
+
+
+def _rename_conversation_from_sidebar(conversation_id: int, conversation_uid: str, widget_key: str) -> None:
+    new_title = (st.session_state.get(widget_key) or "").strip()
+    if not new_title:
+        meta = get_conversation(int(conversation_id)) or {}
+        assignment_name = (meta.get("assignment_name") or "").strip()
+        new_title = f"New conversation ({assignment_name})" if assignment_name else "New conversation"
+
+    touch_conversation(int(conversation_id), title=new_title)
+    fresh = get_conversation(int(conversation_id)) or {}
+    st.session_state[widget_key] = fresh.get("title") or new_title
+
+    current_uid = str(st.session_state.get("conversation_uid") or "")
+    if current_uid == str(conversation_uid):
+        st.session_state["conversation_meta"] = fresh
+        st.session_state["conversation_uid"] = fresh.get("conversation_uid")
 
 
 def _conversation_to_text(messages: List[Dict[str, Any]]) -> str:
@@ -728,46 +763,44 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
         convs = list_conversations_for_user(user_id)
         uid_to_conv = {str(c.get("conversation_uid") or c["id"]): c for c in convs}
         conversation_uids = list(uid_to_conv.keys())
-        current_uid = st.session_state.get("conversation_uid")
+        current_uid = str(st.session_state.get("conversation_uid") or "")
 
         if conversation_uids:
             st.caption("Previous conversations")
             with st.container(height=420):
                 for uid in conversation_uids:
                     conv = uid_to_conv[uid]
-                    label = conv.get("title") or f"Conversation {uid[:8]}"
-                    prefix = "● " if uid == current_uid else ""
-                    if st.button(
-                        prefix + label,
-                        key=f"open_conv_{uid}",
-                        use_container_width=True,
-                    ):
-                        if uid != current_uid:
-                            _load_conversation_into_state(int(conv["id"]))
-                            st.rerun()
+                    conv_id = int(conv["id"])
+                    label = (conv.get("title") or f"Conversation {uid[:8]}").strip()
+                    display_label = label
+                    rename_key = f"thread_rename_{uid}"
+                    if st.session_state.get(rename_key) != label:
+                        st.session_state[rename_key] = label
+
+                    row_cols = st.columns([0.84, 0.16], gap="small")
+                    with row_cols[0]:
+                        btn_type = "primary" if uid == current_uid else "secondary"
+                        if st.button(
+                            display_label,
+                            key=f"open_conv_{uid}",
+                            use_container_width=True,
+                            type=btn_type,
+                        ):
+                            if uid != current_uid:
+                                _load_conversation_into_state(conv_id)
+                                st.rerun()
+                    with row_cols[1]:
+                        with st.popover("⋯", use_container_width=True):
+                            st.text_input(
+                                "Rename conversation",
+                                key=rename_key,
+                                label_visibility="collapsed",
+                                placeholder="Rename conversation",
+                                on_change=_rename_conversation_from_sidebar,
+                                args=(conv_id, uid, rename_key),
+                            )
         else:
             st.caption("No previous conversations yet.")
-
-        conv_id = st.session_state.get("conversation_id")
-        if conv_id:
-            meta = st.session_state.get("conversation_meta") or {}
-            st.divider()
-            st.caption("Thread title")
-            tcols = st.columns([0.78, 0.22])
-            with tcols[0]:
-                new_title = st.text_input(
-                    "Thread title",
-                    value=meta.get("title") or "",
-                    key=f"thread_title_sidebar_{conv_id}",
-                    label_visibility="collapsed",
-                )
-            with tcols[1]:
-                if st.button("Save", key=f"save_title_sidebar_{conv_id}"):
-                    touch_conversation(int(conv_id), title=(new_title.strip() or None))
-                    fresh = get_conversation(int(conv_id)) or {}
-                    st.session_state["conversation_meta"] = fresh
-                    st.session_state["conversation_uid"] = fresh.get("conversation_uid")
-                    st.rerun()
 
     msgs = st.session_state.get("messages", [])
     last_assistant_idx = max((i for i, m in enumerate(msgs) if m["role"] == "assistant"), default=-1)
