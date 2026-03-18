@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import streamlit as st
 from streamlit_cookies_manager_ext import EncryptedCookieManager
 
-from lib.ollama_api import chat_stream
+from lib.ollama_api import chat_stream, list_models
 from lib.render import render_chat_text
 from lib.attachments import (
     extract_text_from_bytes,
@@ -299,11 +299,19 @@ if "user_id" not in st.session_state:
 
 
 
-# ---------------- Model configuration ----------------
+# ---------------- Model list (Ollama Cloud) ----------------
 
-# Model is fixed for all users to avoid inconsistent states.
-# Admins cannot change this via the UI.
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_models() -> List[str]:
+    """Model selection is intentionally fixed to avoid inconsistent states.
+    We do not call `list_models()` during runtime.
+    """
+    return [FIXED_MODEL]
 
+
+def _load_active_model(models: List[str]) -> str:
+    # Always use the fixed model, regardless of saved settings.
+    return FIXED_MODEL
 
 
 # ---------------- Prompts / Assignments ----------------
@@ -475,7 +483,7 @@ def _render_login() -> None:
 # ---------------- Sidebar ----------------
 
 
-def _sidebar() -> Tuple[str, str, Dict[str, Any]]:
+def _sidebar(models: List[str]) -> Tuple[str, str, Dict[str, Any]]:
     user_id = st.session_state["user_id"]
     role = st.session_state["role"]
     is_admin = role == "admin"
@@ -530,35 +538,35 @@ def _sidebar() -> Tuple[str, str, Dict[str, Any]]:
     active_assignment = get_active_assignment()
     st.sidebar.caption(f"**Active assignment:** {active_assignment.get('name')}")
 
-    # Model (fixed)
+    # Model selection (fixed)
     active_model = FIXED_MODEL
+    # Show the fixed model, read-only for everyone (including admins).
     try:
-        st.sidebar.selectbox("Active model", [FIXED_MODEL], index=0, disabled=True)
+        st.sidebar.selectbox("Active model (fixed)", [FIXED_MODEL], index=0, disabled=True)
     except TypeError:
         # Older Streamlit: no 'disabled' kwarg
-        st.sidebar.selectbox("Active model", [FIXED_MODEL], index=0)
-    st.sidebar.caption("Model is fixed by the instructor for consistency.")
+        st.sidebar.selectbox("Active model (fixed)", [FIXED_MODEL], index=0)
 
-        # Assignment selection (admin only)
-    assignments = list_assignments()
-    if assignments:
-        id_to_name = {int(a["id"]): a["name"] for a in assignments}
-        ids = list(id_to_name.keys())
-        active_id = int(active_assignment["id"])
-        idx = ids.index(active_id) if active_id in ids else 0
-        new_id = st.sidebar.selectbox(
-            "Set active assignment",
-            ids,
-            format_func=lambda i: id_to_name.get(int(i), str(i)),
-            index=idx,
-        )
-        if int(new_id) != active_id:
-            set_active_assignment(int(new_id))
-            st.rerun()
-
-    else:
-        st.sidebar.caption(f"**Active model:** {active_model}")
-
+    # Assignment selection (admin only)
+    if is_admin:
+        assignments = list_assignments()
+        if assignments:
+            id_to_name = {int(a["id"]): a["name"] for a in assignments}
+            ids = list(id_to_name.keys())
+            active_id = int(active_assignment["id"])
+            idx = ids.index(active_id) if active_id in ids else 0
+            new_id = st.sidebar.selectbox(
+                "Set active assignment",
+                ids,
+                format_func=lambda i: id_to_name.get(int(i), str(i)),
+                index=idx,
+                key="admin_set_active_assignment",
+            )
+            if int(new_id) != active_id:
+                set_active_assignment(int(new_id))
+                st.rerun()
+        else:
+            st.sidebar.info("No assignments found. Add one in Admin Dashboard.")
     st.sidebar.divider()
     if is_admin:
         page = st.sidebar.radio("Navigation", ["Chat", "Admin Dashboard"], index=0, key="nav_page", label_visibility="collapsed")
@@ -668,8 +676,24 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
             labels[c["id"]] = title
 
         current = st.session_state.get("conversation_id")
-        idx = options.index(current) if current in options else 0
-        picked = st.selectbox("Conversation", options, index=idx, format_func=lambda x: labels.get(x, str(x)), label_visibility="collapsed")
+
+        # Prevent "thread jumping" on reruns:
+        # if the current conversation is missing from options, keep it selected.
+        if current is not None and current not in options:
+            options = [current] + options
+            labels[current] = labels.get(current, f"Conversation {current}")
+            idx = 0
+        else:
+            idx = options.index(current) if current in options else 0
+
+        picked = st.selectbox(
+            "Conversation",
+            options,
+            index=idx,
+            format_func=lambda x: labels.get(x, str(x)),
+            label_visibility="collapsed",
+            key=f"conv_picker_{user_id}",
+        )
         if picked != current:
             if picked is None:
                 st.session_state.pop("conversation_id", None)
@@ -1179,7 +1203,10 @@ def main() -> None:
     if "user_id" not in st.session_state:
         _render_login()
         return
-    page, active_model, active_assignment = _sidebar()
+
+    # Model is fixed; do not call list_models() during runtime.
+    models = _cached_models()
+    page, active_model, active_assignment = _sidebar(models)
 
     if page == "Admin Dashboard" and st.session_state.get("role") == "admin":
         _admin_dashboard(active_model)
