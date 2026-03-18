@@ -271,7 +271,7 @@ def _logout() -> None:
             pass
     cookies["session_token"] = ""
     cookies.save()
-    for k in ["user_id", "role", "session_token", "conversation_id", "messages", "conversation_meta"]:
+    for k in ["user_id", "role", "session_token", "conversation_id", "conversation_uid", "messages", "conversation_meta", "editing"]:
         st.session_state.pop(k, None)
 
 
@@ -333,16 +333,21 @@ def _active_assignment_label() -> str:
 # ---------------- Helpers ----------------
 
 
+def _reset_conversation_state() -> None:
+    st.session_state.pop("conversation_id", None)
+    st.session_state.pop("conversation_uid", None)
+    st.session_state["messages"] = []
+    st.session_state["conversation_meta"] = {}
+    st.session_state.pop("editing", None)
+
+
 def _load_conversation_into_state(conversation_id: int) -> None:
     conv = get_conversation(conversation_id)
     if not conv:
-        st.session_state.pop("conversation_id", None)
-        st.session_state["messages"] = []
-        st.session_state["conversation_meta"] = {}
+        _reset_conversation_state()
         return
 
     msgs = get_conversation_messages(conversation_id)
-    # Attachments
     mids = [m["id"] for m in msgs]
     att_map = list_attachments_for_message_ids(mids)
 
@@ -358,8 +363,35 @@ def _load_conversation_into_state(conversation_id: int) -> None:
         )
 
     st.session_state["conversation_id"] = conversation_id
+    st.session_state["conversation_uid"] = conv.get("conversation_uid")
     st.session_state["messages"] = ui_msgs
     st.session_state["conversation_meta"] = conv
+
+
+def _title_from_first_user_message(text: str, max_chars: int = 72) -> str:
+    line = (text or "").splitlines()[0] if (text or "") else ""
+    cleaned = re.sub(r"\s+", " ", line).strip()
+    cleaned = cleaned.strip("`\"' ")
+    if not cleaned:
+        return "New conversation"
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[: max_chars - 1].rstrip() + "…"
+
+
+def _maybe_title_new_conversation(conversation_id: int, user_text: str) -> None:
+    if not (user_text or "").strip():
+        return
+
+    meta = st.session_state.get("conversation_meta") or get_conversation(conversation_id) or {}
+    current_title = (meta.get("title") or "").strip()
+    if current_title and not current_title.startswith("New conversation"):
+        return
+
+    touch_conversation(conversation_id, title=_title_from_first_user_message(user_text))
+    fresh = get_conversation(conversation_id) or {}
+    st.session_state["conversation_meta"] = fresh
+    st.session_state["conversation_uid"] = fresh.get("conversation_uid")
 
 
 def _conversation_to_text(messages: List[Dict[str, Any]]) -> str:
@@ -657,46 +689,46 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
     role = st.session_state["role"]
     is_admin = role == "admin"
 
-        # Ensure state
     st.session_state.setdefault("messages", [])
     st.session_state.setdefault("conversation_meta", {})
 
-    # Chat header (ChatGPT-like)
-    title = f"{active_model}"
-    if DEFAULT_THINK:
-        title += " — Thinking"
     st.markdown("# DS 330 Chat")
 
-    # Sidebar thread picker
     with st.sidebar:
         st.markdown("#### Conversations")
-        convs = list_conversations_for_user(user_id)
-        options = [None] + [c["id"] for c in convs]
-        labels = {None: "➕ New conversation"}
-        for c in convs:
-            title = c.get("title") or f"Conversation {c['id']}"
-            labels[c["id"]] = title
 
-        current = st.session_state.get("conversation_id")
-        idx = options.index(current) if current in options else 0
-        picked = st.selectbox(
-            "Conversation",
-            options,
-            index=idx,
-            format_func=lambda x: labels.get(x, str(x)),
-            label_visibility="collapsed",
-            key=f"conv_picker_{user_id}",
-        )
-        if picked != current:
-            if picked is None:
-                st.session_state.pop("conversation_id", None)
-                st.session_state["messages"] = []
-                st.session_state["conversation_meta"] = {}
-            else:
-                _load_conversation_into_state(int(picked))
+        if st.button(
+            "➕ Start new conversation",
+            key=f"start_new_conversation_{user_id}",
+            use_container_width=True,
+            type="primary",
+        ):
+            _reset_conversation_state()
             st.rerun()
 
-        # Optional: thread title editor (kept in sidebar to reduce main-panel whitespace)
+        convs = list_conversations_for_user(user_id)
+        uid_to_conv = {str(c.get("conversation_uid") or c["id"]): c for c in convs}
+        conversation_uids = list(uid_to_conv.keys())
+        current_uid = st.session_state.get("conversation_uid")
+
+        if conversation_uids:
+            st.caption("Previous conversations")
+            with st.container(height=420):
+                for uid in conversation_uids:
+                    conv = uid_to_conv[uid]
+                    label = conv.get("title") or f"Conversation {uid[:8]}"
+                    prefix = "● " if uid == current_uid else ""
+                    if st.button(
+                        prefix + label,
+                        key=f"open_conv_{uid}",
+                        use_container_width=True,
+                    ):
+                        if uid != current_uid:
+                            _load_conversation_into_state(int(conv["id"]))
+                            st.rerun()
+        else:
+            st.caption("No previous conversations yet.")
+
         conv_id = st.session_state.get("conversation_id")
         if conv_id:
             meta = st.session_state.get("conversation_meta") or {}
@@ -707,21 +739,17 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
                 new_title = st.text_input(
                     "Thread title",
                     value=meta.get("title") or "",
-                    key="thread_title_sidebar",
+                    key=f"thread_title_sidebar_{conv_id}",
                     label_visibility="collapsed",
                 )
             with tcols[1]:
-                if st.button("Save", key="save_title_sidebar"):
+                if st.button("Save", key=f"save_title_sidebar_{conv_id}"):
                     touch_conversation(int(conv_id), title=(new_title.strip() or None))
-                    st.session_state["conversation_meta"] = get_conversation(int(conv_id)) or {}
+                    fresh = get_conversation(int(conv_id)) or {}
+                    st.session_state["conversation_meta"] = fresh
+                    st.session_state["conversation_uid"] = fresh.get("conversation_uid")
                     st.rerun()
 
-    # # Chat title (ChatGPT-style): show model, and show Thinking if enabled
-    # if active_model:
-    #     _title = active_model + (" — Thinking" if DEFAULT_THINK else "")
-    #     st.markdown(f"# {_title}")
-
-    # Render chat history
     msgs = st.session_state.get("messages", [])
     last_assistant_idx = max((i for i, m in enumerate(msgs) if m["role"] == "assistant"), default=-1)
 
@@ -730,7 +758,6 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
             _render_message(m["role"], m.get("content") or "")
             _render_attachments(m.get("attachments") or [])
 
-            # Per-message copy button (one per message)
             _copy_button(
                 m.get("content") or "",
                 key=f"copy_msg_{m.get('id','x')}",
@@ -739,7 +766,6 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
                 tooltip="Copy message",
             )
 
-            # Copy whole conversation (bottom of last assistant response)
             if i == last_assistant_idx:
                 _copy_button(
                     _conversation_to_text(msgs),
@@ -749,7 +775,6 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
                     tooltip="Copy whole conversation (text only)",
                 )
 
-            # Conversation edit controls — ADMIN ONLY
             if is_admin and m["role"] == "user":
                 edit_key = f"edit_btn_{m['id']}"
                 if st.button("✏️ Edit", key=edit_key, help="Edit this user message and regenerate from here"):
@@ -760,7 +785,6 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
                     }
                     st.rerun()
 
-    # Admin edit panel (admin only)
     if is_admin and st.session_state.get("editing"):
         ed = st.session_state["editing"]
         st.info("Admin edit mode: update the message and regenerate from that point.")
@@ -774,11 +798,8 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
 
             update_message(ed["message_id"], ed["draft"])
             delete_messages_after(int(conv_id), int(ed["message_id"]))
-
-            # Reload from DB
             _load_conversation_into_state(int(conv_id))
 
-            # Regenerate assistant response
             with st.chat_message("assistant"):
                 ph = st.empty()
                 full = ""
@@ -816,7 +837,6 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
             st.session_state["editing"] = None
             st.rerun()
 
-    # Chat input with files (ChatGPT-style)
     prompt_val = st.chat_input(
         f"Message {APP_NAME}",
         accept_file="multiple",
@@ -826,7 +846,6 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
     if not prompt_val:
         return
 
-    # Streamlit returns either string (older versions) or ChatInputValue (newer)
     if isinstance(prompt_val, str):
         user_text = prompt_val
         files = []
@@ -834,7 +853,6 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
         user_text = (prompt_val.text or "")
         files = list(prompt_val.files or [])
 
-    # Ensure conversation exists
     conv_id = st.session_state.get("conversation_id")
     if not conv_id:
         base_prompt = get_base_system_prompt(DEFAULT_BASE_PROMPT)
@@ -852,13 +870,14 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
             assignment_name=active_assignment.get("name"),
             assignment_prompt=assignment_prompt,
         )
+        fresh = get_conversation(int(conv_id)) or {}
         st.session_state["conversation_id"] = conv_id
-        st.session_state["conversation_meta"] = get_conversation(int(conv_id)) or {}
+        st.session_state["conversation_uid"] = fresh.get("conversation_uid")
+        st.session_state["conversation_meta"] = fresh
 
-    # Persist user message
     user_msg_id = add_message(int(conv_id), "user", user_text)
+    _maybe_title_new_conversation(int(conv_id), user_text)
 
-    # Handle files -> attachments
     attachments: List[Dict[str, Any]] = []
     for f in files:
         raw = f.getvalue()
@@ -892,16 +911,13 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
             }
         )
 
-    # Add to UI state
     st.session_state["messages"].append(
         {"id": user_msg_id, "role": "user", "content": user_text, "attachments": attachments}
     )
 
-    # Render user message
     with st.chat_message("user"):
         st.markdown(user_text)
         _render_attachments(attachments)
-        # per message copy
         _copy_button(
             user_text,
             key=f"copy_msg_{user_msg_id}",
@@ -910,7 +926,6 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
             tooltip="Copy message",
         )
 
-    # Build payload and stream assistant
     payload = _build_payload_messages(int(conv_id))
     with st.chat_message("assistant"):
         ph = st.empty()
@@ -940,12 +955,12 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
 
     asst_id = add_message(int(conv_id), "assistant", full)
 
-    # Update UI state
     st.session_state["messages"].append(
         {"id": asst_id, "role": "assistant", "content": full, "attachments": []}
     )
 
     touch_conversation(int(conv_id), model=active_model)
+    _load_conversation_into_state(int(conv_id))
     st.rerun()
 
 

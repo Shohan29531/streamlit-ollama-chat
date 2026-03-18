@@ -1,6 +1,8 @@
 import os
+import re
 import secrets
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
@@ -239,6 +241,7 @@ def init_db() -> None:
         """
         CREATE TABLE IF NOT EXISTS conversations (
             id INTEGER PRIMARY KEY,
+            conversation_uid TEXT UNIQUE,
             user_id TEXT NOT NULL,
             role TEXT NOT NULL,
             title TEXT,
@@ -256,6 +259,7 @@ def init_db() -> None:
         else """
         CREATE TABLE IF NOT EXISTS conversations (
             id SERIAL PRIMARY KEY,
+            conversation_uid TEXT UNIQUE,
             user_id TEXT NOT NULL,
             role TEXT NOT NULL,
             title TEXT,
@@ -330,12 +334,14 @@ def init_db() -> None:
     
     # users (optional per-user API key)
     _add_column("users", "api_key", "TEXT")
-# Lightweight migrations for older schemas
+
+    # Lightweight migrations for older schemas
     # conversations new columns
     _add_column("conversations", "base_prompt", "TEXT")
     _add_column("conversations", "assignment_id", "INTEGER")
     _add_column("conversations", "assignment_name", "TEXT")
     _add_column("conversations", "assignment_prompt", "TEXT")
+    _add_column("conversations", "conversation_uid", "TEXT")
 
     # assignments new column (if table existed without prompt)
     _add_column("assignments", "prompt", "TEXT")
@@ -352,7 +358,33 @@ def init_db() -> None:
 
     # Ensure at least one assignment + active assignment selection
     _ensure_default_assignment()
+    _ensure_conversation_uids()
     _backfill_conversations_to_default_assignment()
+
+
+def _ensure_conversation_uids() -> None:
+    """Ensure each conversation has a stable unique public UID."""
+    if _USE_PG:
+        _exec(
+            "CREATE UNIQUE INDEX IF NOT EXISTS conversations_conversation_uid_idx ON conversations (conversation_uid) WHERE conversation_uid IS NOT NULL"
+        )
+    else:
+        _exec(
+            "CREATE UNIQUE INDEX IF NOT EXISTS conversations_conversation_uid_idx ON conversations (conversation_uid)"
+        )
+
+    rows = _exec(
+        "SELECT id FROM conversations WHERE conversation_uid IS NULL OR conversation_uid = ''",
+        fetch="all",
+    )
+    for r in _rows_to_dicts(rows):
+        cid = int(r.get("id"))
+        _exec(
+            "UPDATE conversations SET conversation_uid = ? WHERE id = ?"
+            if not _USE_PG
+            else "UPDATE conversations SET conversation_uid = %s WHERE id = %s",
+            (uuid.uuid4().hex, cid),
+        )
 
 
 def _ensure_default_assignment() -> None:
@@ -815,7 +847,6 @@ def set_base_system_prompt(prompt: str) -> None:
 
 
 # ---------------- Conversations ----------------
-import re
 
 _SUFFIX_RE = re.compile(r"^(.*?)(?:\s+(\d+))$")
 
@@ -906,21 +937,22 @@ def create_conversation(
     assignment_prompt: Optional[str] = None,
 ) -> int:
     now = _now_iso()
-    base_title = _dedupe_conversation_title(user_id, title)
-    title = _ensure_title_has_assignment(base_title, assignment_name)
+    title = _ensure_title_has_assignment(title, assignment_name)
+    conversation_uid = uuid.uuid4().hex
 
     if _USE_PG:
         row = _exec(
             """
             INSERT INTO conversations (
-                user_id, role, title, model, system_prompt,
+                conversation_uid, user_id, role, title, model, system_prompt,
                 base_prompt, assignment_id, assignment_name, assignment_prompt,
                 created_at, updated_at
             )
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             RETURNING id
             """,
             (
+                conversation_uid,
                 user_id,
                 role,
                 title,
@@ -940,13 +972,14 @@ def create_conversation(
         _exec(
             """
             INSERT INTO conversations (
-                user_id, role, title, model, system_prompt,
+                conversation_uid, user_id, role, title, model, system_prompt,
                 base_prompt, assignment_id, assignment_name, assignment_prompt,
                 created_at, updated_at
             )
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
+                conversation_uid,
                 user_id,
                 role,
                 title,
@@ -1020,14 +1053,14 @@ def get_conversation(conversation_id: int) -> Optional[Dict[str, Any]]:
 def list_conversations_for_user(user_id: str, limit: int = 200) -> List[Dict[str, Any]]:
     rows = _exec(
         """
-        SELECT id, title, updated_at, model, assignment_name
+        SELECT id, conversation_uid, title, updated_at, model, assignment_name
         FROM conversations
         WHERE user_id = ?
         ORDER BY updated_at DESC
         LIMIT ?
         """ if not _USE_PG else
         """
-        SELECT id, title, updated_at, model, assignment_name
+        SELECT id, conversation_uid, title, updated_at, model, assignment_name
         FROM conversations
         WHERE user_id = %s
         ORDER BY updated_at DESC
@@ -1093,7 +1126,7 @@ def list_conversations_admin(
     sql = (
         f"SELECT id, user_id, role, title, model, assignment_id, assignment_name, updated_at FROM conversations {wsql} ORDER BY updated_at DESC LIMIT ?"
         if not _USE_PG
-        else f"SELECT id, user_id, role, title, model, assignment_id, assignment_name, updated_at FROM conversations {wsql} ORDER BY updated_at DESC LIMIT %s"
+        else f"SELECT id, conversation_uid, user_id, role, title, model, assignment_id, assignment_name, updated_at FROM conversations {wsql} ORDER BY updated_at DESC LIMIT %s"
     )
 
     params.append(limit)
