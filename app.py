@@ -189,6 +189,16 @@ st.markdown(
     border-color: rgba(0, 0, 0, 0.18) !important;
     background: rgba(0, 0, 0, 0.04) !important;
   }
+
+  .ds330-thread-main-btn div.stButton > button {
+    justify-content: flex-start !important;
+    text-align: left !important;
+  }
+
+  .ds330-thread-main-btn div.stButton > button p {
+    text-align: left !important;
+    width: 100% !important;
+  }
 }
 </style>
 """,
@@ -737,6 +747,7 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
 
                     row_cols = st.columns([0.84, 0.16], gap="small")
                     with row_cols[0]:
+                        st.markdown('<div class="ds330-thread-main-btn">', unsafe_allow_html=True)
                         btn_type = "primary" if uid == current_uid else "secondary"
                         if st.button(
                             display_label,
@@ -747,6 +758,7 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
                             if uid != current_uid:
                                 _load_conversation_into_state(conv_id)
                                 st.rerun()
+                        st.markdown('</div>', unsafe_allow_html=True)
 
                     with row_cols[1]:
                         try:
