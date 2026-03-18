@@ -166,38 +166,47 @@ st.markdown(
 
   
 
-  /* Sidebar: flex column so we can pin logout to bottom */
+  /* Sidebar layout + chat-list button alignment */
 @media (min-width: 0px) {
   section[data-testid="stSidebar"] > div:first-child {
     display: flex;
     flex-direction: column;
     height: 100vh;
   }
+
   .ds330-sidebar-spacer { flex: 1 1 auto; }
+
+  section[data-testid="stSidebar"] div.stButton > button {
+    justify-content: flex-start !important;
+    text-align: left !important;
+  }
+
+  section[data-testid="stSidebar"] div.stButton > button * {
+    text-align: left !important;
+  }
+
   .ds330-sidebar-logout-wrap {
     padding-top: 0.75rem;
     padding-bottom: 0.25rem;
     border-top: 1px solid rgba(0, 0, 0, 0.08);
   }
+
   .ds330-sidebar-logout-wrap div.stButton > button {
     width: 100%;
+    justify-content: center !important;
+    text-align: center !important;
     border: 1px solid rgba(0, 0, 0, 0.12) !important;
     border-radius: 10px !important;
     background: rgba(0, 0, 0, 0.02) !important;
   }
+
+  .ds330-sidebar-logout-wrap div.stButton > button * {
+    text-align: center !important;
+  }
+
   .ds330-sidebar-logout-wrap div.stButton > button:hover {
     border-color: rgba(0, 0, 0, 0.18) !important;
     background: rgba(0, 0, 0, 0.04) !important;
-  }
-
-  .ds330-thread-main-btn div.stButton > button {
-    justify-content: flex-start !important;
-    text-align: left !important;
-  }
-
-  .ds330-thread-main-btn div.stButton > button p {
-    text-align: left !important;
-    width: 100% !important;
   }
 }
 </style>
@@ -402,19 +411,6 @@ def _maybe_title_new_conversation(conversation_id: int, user_text: str) -> None:
     fresh = get_conversation(conversation_id) or {}
     st.session_state["conversation_meta"] = fresh
     st.session_state["conversation_uid"] = fresh.get("conversation_uid")
-
-
-def _commit_sidebar_thread_rename(conversation_id: int, state_key: str) -> None:
-    raw_title = str(st.session_state.get(state_key) or "").strip()
-    if not raw_title:
-        return
-
-    touch_conversation(int(conversation_id), title=raw_title)
-    fresh = get_conversation(int(conversation_id)) or {}
-
-    if int(st.session_state.get("conversation_id") or 0) == int(conversation_id):
-        st.session_state["conversation_meta"] = fresh
-        st.session_state["conversation_uid"] = fresh.get("conversation_uid")
 
 
 def _conversation_to_text(messages: List[Dict[str, Any]]) -> str:
@@ -739,44 +735,39 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
             with st.container(height=420):
                 for uid in conversation_uids:
                     conv = uid_to_conv[uid]
-                    conv_id = int(conv["id"])
                     label = conv.get("title") or f"Conversation {uid[:8]}"
-                    display_label = ("● " + label) if uid == current_uid else label
-                    rename_key = f"rename_thread_input_{conv_id}"
-                    st.session_state[rename_key] = label
-
-                    row_cols = st.columns([0.84, 0.16], gap="small")
-                    with row_cols[0]:
-                        st.markdown('<div class="ds330-thread-main-btn">', unsafe_allow_html=True)
-                        btn_type = "primary" if uid == current_uid else "secondary"
-                        if st.button(
-                            display_label,
-                            key=f"open_conv_{uid}",
-                            use_container_width=True,
-                            type=btn_type,
-                        ):
-                            if uid != current_uid:
-                                _load_conversation_into_state(conv_id)
-                                st.rerun()
-                        st.markdown('</div>', unsafe_allow_html=True)
-
-                    with row_cols[1]:
-                        try:
-                            pop = st.popover("⋯", use_container_width=True)
-                        except TypeError:
-                            pop = st.popover("⋯")
-
-                        with pop:
-                            st.caption("Rename conversation")
-                            st.text_input(
-                                "Rename conversation",
-                                key=rename_key,
-                                label_visibility="collapsed",
-                                on_change=_commit_sidebar_thread_rename,
-                                args=(conv_id, rename_key),
-                            )
+                    prefix = "● " if uid == current_uid else ""
+                    if st.button(
+                        prefix + label,
+                        key=f"open_conv_{uid}",
+                        use_container_width=True,
+                    ):
+                        if uid != current_uid:
+                            _load_conversation_into_state(int(conv["id"]))
+                            st.rerun()
         else:
             st.caption("No previous conversations yet.")
+
+        conv_id = st.session_state.get("conversation_id")
+        if conv_id:
+            meta = st.session_state.get("conversation_meta") or {}
+            st.divider()
+            st.caption("Thread title")
+            tcols = st.columns([0.78, 0.22])
+            with tcols[0]:
+                new_title = st.text_input(
+                    "Thread title",
+                    value=meta.get("title") or "",
+                    key=f"thread_title_sidebar_{conv_id}",
+                    label_visibility="collapsed",
+                )
+            with tcols[1]:
+                if st.button("Save", key=f"save_title_sidebar_{conv_id}"):
+                    touch_conversation(int(conv_id), title=(new_title.strip() or None))
+                    fresh = get_conversation(int(conv_id)) or {}
+                    st.session_state["conversation_meta"] = fresh
+                    st.session_state["conversation_uid"] = fresh.get("conversation_uid")
+                    st.rerun()
 
     msgs = st.session_state.get("messages", [])
     last_assistant_idx = max((i for i, m in enumerate(msgs) if m["role"] == "assistant"), default=-1)
