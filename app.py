@@ -540,15 +540,15 @@ def _sidebar(models: List[str]) -> Tuple[str, str, Dict[str, Any]]:
 
     # Model selection (fixed)
     active_model = FIXED_MODEL
-    # Show the fixed model, read-only for everyone (including admins).
-    try:
-        st.sidebar.selectbox("Active model (fixed)", [FIXED_MODEL], index=0, disabled=True)
-    except TypeError:
-        # Older Streamlit: no 'disabled' kwarg
-        st.sidebar.selectbox("Active model (fixed)", [FIXED_MODEL], index=0)
-
-    # Assignment selection (admin only)
     if is_admin:
+        # Show the fixed model but prevent changes (no runtime model reloads).
+        try:
+            st.sidebar.selectbox("Active model (fixed)", [FIXED_MODEL], index=0, disabled=True)
+        except TypeError:
+            # Older Streamlit versions may not support `disabled` on selectbox.
+            st.sidebar.text_input("Active model (fixed)", value=FIXED_MODEL, disabled=True)
+
+        # Assignment selection (admin only)
         assignments = list_assignments()
         if assignments:
             id_to_name = {int(a["id"]): a["name"] for a in assignments}
@@ -560,13 +560,15 @@ def _sidebar(models: List[str]) -> Tuple[str, str, Dict[str, Any]]:
                 ids,
                 format_func=lambda i: id_to_name.get(int(i), str(i)),
                 index=idx,
-                key="admin_set_active_assignment",
+                key="admin_active_assignment_select",
             )
             if int(new_id) != active_id:
                 set_active_assignment(int(new_id))
                 st.rerun()
-        else:
-            st.sidebar.info("No assignments found. Add one in Admin Dashboard.")
+
+    else:
+        st.sidebar.caption(f"**Active model:** {active_model}")
+
     st.sidebar.divider()
     if is_admin:
         page = st.sidebar.radio("Navigation", ["Chat", "Admin Dashboard"], index=0, key="nav_page", label_visibility="collapsed")
@@ -676,16 +678,7 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
             labels[c["id"]] = title
 
         current = st.session_state.get("conversation_id")
-
-        # Prevent "thread jumping" on reruns:
-        # if the current conversation is missing from options, keep it selected.
-        if current is not None and current not in options:
-            options = [current] + options
-            labels[current] = labels.get(current, f"Conversation {current}")
-            idx = 0
-        else:
-            idx = options.index(current) if current in options else 0
-
+        idx = options.index(current) if current in options else 0
         picked = st.selectbox(
             "Conversation",
             options,

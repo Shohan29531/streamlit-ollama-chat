@@ -906,8 +906,9 @@ def create_conversation(
     assignment_prompt: Optional[str] = None,
 ) -> int:
     now = _now_iso()
-    title = _ensure_title_has_assignment(title, assignment_name)
-    
+    base_title = _dedupe_conversation_title(user_id, title)
+    title = _ensure_title_has_assignment(base_title, assignment_name)
+
     if _USE_PG:
         row = _exec(
             """
