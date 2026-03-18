@@ -166,62 +166,25 @@ st.markdown(
 
   
 
-  /* Sidebar layout + chat-list button alignment */
+  /* Sidebar: flex column so we can pin logout to bottom */
 @media (min-width: 0px) {
   section[data-testid="stSidebar"] > div:first-child {
     display: flex;
     flex-direction: column;
     height: 100vh;
   }
-
   .ds330-sidebar-spacer { flex: 1 1 auto; }
-
-  section[data-testid="stSidebar"] div.stButton > button {
-    justify-content: flex-start !important;
-    text-align: left !important;
-  }
-
-  section[data-testid="stSidebar"] div.stButton > button p,
-  section[data-testid="stSidebar"] div.stButton > button span {
-    text-align: left !important;
-    width: 100% !important;
-  }
-
-  section[data-testid="stSidebar"] div[data-testid="stPopover"] button {
-    justify-content: center !important;
-    text-align: center !important;
-    min-width: 2.25rem !important;
-    padding-left: 0.25rem !important;
-    padding-right: 0.25rem !important;
-  }
-
-  section[data-testid="stSidebar"] div[data-testid="stPopover"] button p,
-  section[data-testid="stSidebar"] div[data-testid="stPopover"] button span {
-    text-align: center !important;
-    width: auto !important;
-  }
-
   .ds330-sidebar-logout-wrap {
     padding-top: 0.75rem;
     padding-bottom: 0.25rem;
     border-top: 1px solid rgba(0, 0, 0, 0.08);
   }
-
   .ds330-sidebar-logout-wrap div.stButton > button {
     width: 100%;
-    justify-content: center !important;
-    text-align: center !important;
     border: 1px solid rgba(0, 0, 0, 0.12) !important;
     border-radius: 10px !important;
     background: rgba(0, 0, 0, 0.02) !important;
   }
-
-  .ds330-sidebar-logout-wrap div.stButton > button p,
-  .ds330-sidebar-logout-wrap div.stButton > button span {
-    text-align: center !important;
-    width: auto !important;
-  }
-
   .ds330-sidebar-logout-wrap div.stButton > button:hover {
     border-color: rgba(0, 0, 0, 0.18) !important;
     background: rgba(0, 0, 0, 0.04) !important;
@@ -431,19 +394,15 @@ def _maybe_title_new_conversation(conversation_id: int, user_text: str) -> None:
     st.session_state["conversation_uid"] = fresh.get("conversation_uid")
 
 
-def _rename_conversation_from_sidebar(conversation_id: int, conversation_uid: str, widget_key: str) -> None:
-    new_title = (st.session_state.get(widget_key) or "").strip()
-    if not new_title:
-        meta = get_conversation(int(conversation_id)) or {}
-        assignment_name = (meta.get("assignment_name") or "").strip()
-        new_title = f"New conversation ({assignment_name})" if assignment_name else "New conversation"
+def _commit_sidebar_thread_rename(conversation_id: int, state_key: str) -> None:
+    raw_title = str(st.session_state.get(state_key) or "").strip()
+    if not raw_title:
+        return
 
-    touch_conversation(int(conversation_id), title=new_title)
+    touch_conversation(int(conversation_id), title=raw_title)
     fresh = get_conversation(int(conversation_id)) or {}
-    st.session_state[widget_key] = fresh.get("title") or new_title
 
-    current_uid = str(st.session_state.get("conversation_uid") or "")
-    if current_uid == str(conversation_uid):
+    if int(st.session_state.get("conversation_id") or 0) == int(conversation_id):
         st.session_state["conversation_meta"] = fresh
         st.session_state["conversation_uid"] = fresh.get("conversation_uid")
 
@@ -763,7 +722,7 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
         convs = list_conversations_for_user(user_id)
         uid_to_conv = {str(c.get("conversation_uid") or c["id"]): c for c in convs}
         conversation_uids = list(uid_to_conv.keys())
-        current_uid = str(st.session_state.get("conversation_uid") or "")
+        current_uid = st.session_state.get("conversation_uid")
 
         if conversation_uids:
             st.caption("Previous conversations")
@@ -771,11 +730,10 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
                 for uid in conversation_uids:
                     conv = uid_to_conv[uid]
                     conv_id = int(conv["id"])
-                    label = (conv.get("title") or f"Conversation {uid[:8]}").strip()
-                    display_label = label
-                    rename_key = f"thread_rename_{uid}"
-                    if st.session_state.get(rename_key) != label:
-                        st.session_state[rename_key] = label
+                    label = conv.get("title") or f"Conversation {uid[:8]}"
+                    display_label = ("● " + label) if uid == current_uid else label
+                    rename_key = f"rename_thread_input_{conv_id}"
+                    st.session_state[rename_key] = label
 
                     row_cols = st.columns([0.84, 0.16], gap="small")
                     with row_cols[0]:
@@ -789,15 +747,21 @@ def _chat_page(active_model: str, active_assignment: Dict[str, Any]) -> None:
                             if uid != current_uid:
                                 _load_conversation_into_state(conv_id)
                                 st.rerun()
+
                     with row_cols[1]:
-                        with st.popover("⋯", use_container_width=True):
+                        try:
+                            pop = st.popover("⋯", use_container_width=True)
+                        except TypeError:
+                            pop = st.popover("⋯")
+
+                        with pop:
+                            st.caption("Rename conversation")
                             st.text_input(
                                 "Rename conversation",
                                 key=rename_key,
                                 label_visibility="collapsed",
-                                placeholder="Rename conversation",
-                                on_change=_rename_conversation_from_sidebar,
-                                args=(conv_id, uid, rename_key),
+                                on_change=_commit_sidebar_thread_rename,
+                                args=(conv_id, rename_key),
                             )
         else:
             st.caption("No previous conversations yet.")
