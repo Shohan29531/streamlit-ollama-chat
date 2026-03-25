@@ -53,11 +53,12 @@ _USE_PG = bool(DATABASE_URL)
 # Supabase Storage (optional)
 SUPABASE_URL = _get_secret("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = _get_secret("SUPABASE_SERVICE_ROLE_KEY")
-SUPABASE_STORAGE_BUCKET = _get_secret("SUPABASE_STORAGE_BUCKET", "ds330-chat-uploads")
+SUPABASE_STORAGE_BUCKET = _get_secret("SUPABASE_STORAGE_BUCKET") or _get_secret("SUPABASE_BUCKET", "ds330-chat-uploads")
 USE_SUPABASE_STORAGE = (
     _get_secret("USE_SUPABASE_STORAGE", "true").lower() == "true"
     and bool(SUPABASE_URL)
     and bool(SUPABASE_SERVICE_ROLE_KEY)
+    and bool(SUPABASE_STORAGE_BUCKET)
 )
 
 
@@ -1216,6 +1217,36 @@ def _supabase_client():
         return None
 
 
+def _get_attachment_upload_context(message_id: int) -> Tuple[int, str]:
+    row = _exec(
+        """
+        SELECT m.conversation_id AS conversation_id, c.user_id AS user_id
+        FROM messages m
+        JOIN conversations c ON c.id = m.conversation_id
+        WHERE m.id = ?
+        """ if not _USE_PG else
+        """
+        SELECT m.conversation_id AS conversation_id, c.user_id AS user_id
+        FROM messages m
+        JOIN conversations c ON c.id = m.conversation_id
+        WHERE m.id = %s
+        """,
+        (message_id,),
+        fetch="one",
+    )
+    if not row:
+        raise RuntimeError(f"Cannot attach file: message {message_id} was not found.")
+
+    if isinstance(row, dict):
+        conversation_id = int(row["conversation_id"])
+        user_id = str(row["user_id"])
+    else:
+        conversation_id = int(row[0])
+        user_id = str(row[1])
+
+    return conversation_id, user_id
+
+
 def add_attachment(
     message_id: int,
     kind: str,
@@ -1237,18 +1268,15 @@ def add_attachment(
 
     sb = _supabase_client()
     if sb is not None:
-        # upload under a deterministic prefix
-        safe_name = filename.replace("/", "_")
-        path = f"m{message_id}/{secrets.token_urlsafe(8)}-{safe_name}"
-        sb.upload_bytes(
-            supabase_url=SUPABASE_URL,
-            service_role_key=SUPABASE_SERVICE_ROLE_KEY,
-            bucket=SUPABASE_STORAGE_BUCKET,
-            path=path,
+        conversation_id, user_id = _get_attachment_upload_context(message_id)
+        bucket, path = sb.upload_bytes(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            message_id=message_id,
+            filename=filename,
+            mime=mime or "application/octet-stream",
             data=data,
-            content_type=mime or "application/octet-stream",
         )
-        bucket = SUPABASE_STORAGE_BUCKET
         blob = None
 
     _exec(
@@ -1289,8 +1317,6 @@ def list_attachments_for_message_ids(message_ids: List[int]) -> Dict[int, List[D
         if data is None and sb is not None and r.get("bucket") and r.get("path"):
             try:
                 data = sb.download_bytes(
-                    supabase_url=SUPABASE_URL,
-                    service_role_key=SUPABASE_SERVICE_ROLE_KEY,
                     bucket=r["bucket"],
                     path=r["path"],
                 )
